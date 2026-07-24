@@ -45,6 +45,11 @@ export class PinchApiError extends PinchError {
   constructor(
     message: string,
     public readonly status?: number,
+    /**
+     * Raw upstream error response body, retained for local diagnostics only.
+     * Never include it in error messages or public HTTP responses.
+     */
+    public readonly upstreamBody?: string,
   ) {
     super(message);
   }
@@ -249,14 +254,27 @@ export async function pinchRequest<T>(
   }
 
   if (!response.ok) {
+    const upstreamBody = await response.text().catch(() => undefined);
     throw new PinchApiError(
       `Pinch API request to ${safePath} failed with HTTP ${response.status}.`,
       response.status,
+      upstreamBody,
     );
   }
 
   if (response.status === 204) {
     return undefined as T;
   }
-  return (await response.json()) as T;
+
+  // Some Pinch endpoints answer success with plain text (e.g. a bare ID)
+  // rather than JSON, so fall back to the raw text when parsing fails.
+  const rawBody = await response.text();
+  if (rawBody === "") {
+    return undefined as T;
+  }
+  try {
+    return JSON.parse(rawBody) as T;
+  } catch {
+    return rawBody as T;
+  }
 }
