@@ -110,14 +110,6 @@ The webhook receiver:
 - Display the governing assumption beside the result, not in a footnote.
 - The model may interpret customer language, but deterministic code makes eligibility and execution decisions.
 
-## Known technical debt
-
-The localhost-only request guard is duplicated in:
-
-- `src/app/api/pinch/dev/payer/route.ts`
-- `src/app/api/pinch/dev/payment-date/route.ts`
-
-Extract it into one shared server-only helper the next time either route is substantively modified. Do not perform a standalone refactor unless the current build step requires touching one of those routes.
 
 ## Working rules
 
