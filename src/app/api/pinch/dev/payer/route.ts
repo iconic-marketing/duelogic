@@ -163,6 +163,9 @@ export async function POST(request: NextRequest) {
 
   const rawBody = await request.text();
   let payer: PayerRequestBody;
+  // Passed only via the pinchRequest option (the Current-Merchant header),
+  // never in the JSON body sent to Pinch. Undefined = single-merchant.
+  let merchantId: string | undefined;
   if (rawBody.trim() === "") {
     payer = buildSyntheticPayer();
   } else {
@@ -183,12 +186,24 @@ export async function POST(request: NextRequest) {
       );
     }
     payer = custom;
+
+    const rawMerchantId = (parsed as Record<string, unknown>).merchantId;
+    if (rawMerchantId !== undefined) {
+      if (typeof rawMerchantId !== "string" || rawMerchantId.trim() === "") {
+        return NextResponse.json(
+          { ok: false, stage: "validation" },
+          { status: 400 },
+        );
+      }
+      merchantId = rawMerchantId.trim();
+    }
   }
 
   try {
     const result = await pinchRequest<unknown>("payers", {
       method: "POST",
       body: payer,
+      merchantId,
     });
 
     const payerId = extractPayerId(result);
