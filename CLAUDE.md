@@ -63,6 +63,16 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - Pinch error bodies can contain tokenised payment-source data and payer personally identifiable information. Never log or return complete upstream bodies; log only route or operation, stage, error class, upstream HTTP status and safe identifiers.
 - The payment read response may expose source identity at `attempts[].source.id` (proven live), as well as possibly `sourceId` or `source.id`. Do not probe other shapes.
 
+## Calculated-payments contract
+
+- `GET /plans/{planId}/calculated-payments` returns a bare JSON array.
+- Each calculated payment carries `amountInCents` (integer cents), `paymentDate` (zoned ISO timestamp), `description` and `recurringPaymentIndex`.
+- `recurringPaymentIndex` identifies the sequence order of the calculated payments.
+- Pinch may return merchant-local midnight as a UTC timestamp dated the preceding UTC day (e.g. Sydney midnight appears as `T14:00:00Z` on the previous calendar date).
+- Convert `paymentDate` to a calendar date with a timezone-aware formatter in the merchant timezone. Never slice the UTC timestamp or rely on the server timezone.
+- The managed sandbox merchant timezone is `Australia/Sydney`.
+- Production code must use `Merchant.timezone`, never a hard-coded constant or the server's own timezone.
+
 ## Outcome events
 
 The proven payment lifecycle events are:
