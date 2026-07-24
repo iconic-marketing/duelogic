@@ -113,6 +113,18 @@ The webhook receiver:
 - A failed payment-date mutation must never be automatically repeated.
 - The date-change confirmation is temporary operation feedback, not payment state: it is cleared once a later webhook event arrives or the payment is no longer scheduled, and the move controls are disabled whenever the current Pinch status is not scheduled.
 
+## Timing-pattern detector
+
+- Pattern detection is deterministic: pure functions in `src/lib/duelogic/pattern-detector.ts` — no clock reads, randomness, network, environment access or input mutation.
+- Only `insufficient-funds` dishonours are candidates; other dishonour reasons never enter pattern evidence.
+- A flag requires at least two clustered candidate dishonours (day-of-month within one inclusive four-day window, or at least two on the same weekday).
+- A flag also requires approved later-settlement evidence: an approved retry strictly after processedDate that falls outside the full selected detection window (day-of-month) or on a different weekday (day-of-week).
+- `windowStartDay` and `windowEndDay` record the full inclusive detection window that selected the cluster, not the observed member-day extremes; when several windows contain the same member set, the earliest window start is the selected window.
+- The detector identifies timing-linked payment patterns only — never payday, employment, affordability, income, hardship or any financial cause.
+- `proposedShiftDays` is the lower-median of observed approved-retry delays (minimum 1): a shift worth testing, not a claim any dishonour would have been prevented.
+- Seed validation (`src/lib/duelogic/pattern-detector-validation.ts`) must continue to find exactly the intentionally planted pattern payers and no others.
+- Detection must be invariant to input record order, with stable flag IDs derived from payerId and the as-of date.
+
 ## DueLogic analysis rules
 
 - Pattern detection filters to dishonours with the `insufficient-funds` reason only.

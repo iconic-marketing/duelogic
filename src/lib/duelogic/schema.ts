@@ -71,6 +71,77 @@ export interface PaymentOutcomeEvent {
   outcome: PaymentOutcome | null;
 }
 
+/** Clustering basis for a detected timing-linked payment pattern. */
+export type PatternBasis = "day-of-month" | "day-of-week";
+
+export type Weekday =
+  | "monday"
+  | "tuesday"
+  | "wednesday"
+  | "thursday"
+  | "friday"
+  | "saturday"
+  | "sunday";
+
+/**
+ * One clustered insufficient-funds dishonour that later settled through an
+ * approved retry outside the cluster. Observed history only — never a claim
+ * about what a different schedule would have prevented.
+ */
+export interface TimingPatternSettlementEvidence {
+  paymentRecordId: string;
+  /** YYYY-MM-DD. */
+  scheduledDate: string;
+  /** YYYY-MM-DD. */
+  processedDate: string;
+  /** YYYY-MM-DD; strictly after processedDate. */
+  retryDate: string;
+  /** Positive whole calendar days from processedDate to retryDate. */
+  delayDays: number;
+}
+
+/**
+ * Why a payer was flagged: the clustered dishonours and their approved
+ * later-settlement evidence. Strictly typed — no free-form JSON. Identifies a
+ * payment-timing pattern only; it never encodes payday, employment,
+ * affordability, income, hardship or any other financial cause.
+ */
+export interface TimingPatternEvidence {
+  basis: PatternBasis;
+  /**
+   * First day of the full inclusive detection window that selected the
+   * cluster; present only for the day-of-month basis.
+   */
+  windowStartDay?: number;
+  /**
+   * Last day of that inclusive detection window; settlement evidence must
+   * fall outside [windowStartDay, windowEndDay]. Day-of-month basis only.
+   */
+  windowEndDay?: number;
+  /** Present only for the day-of-week basis. */
+  weekday?: Weekday;
+  qualifyingDishonourCount: number;
+  qualifyingPaymentRecordIds: string[];
+  /** YYYY-MM-DD, ascending. */
+  qualifyingScheduledDates: string[];
+  settlementEvidence: TimingPatternSettlementEvidence[];
+}
+
+export interface PatternFlag {
+  id: string;
+  merchantId: string;
+  payerId: string;
+  patternType: "timing-linked";
+  /**
+   * Lower-median of the observed approved-retry delays, minimum 1. A shift
+   * worth testing — not a claim that any dishonour would have been prevented.
+   */
+  proposedShiftDays: number;
+  /** YYYY-MM-DD anchor the detection ran against. */
+  detectedAsOfDate: string;
+  evidence: TimingPatternEvidence;
+}
+
 /**
  * Deterministic record of a payment-date change decision. Eligibility and
  * execution are decided by code against a versioned policy — never by model
