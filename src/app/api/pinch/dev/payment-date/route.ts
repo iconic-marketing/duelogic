@@ -136,20 +136,38 @@ function calendarDateOf(value: string): string | null {
 interface ValidatedInput {
   paymentId: string;
   transactionDate: string;
+  /**
+   * Passed only via the pinchRequest option (the Current-Merchant header),
+   * never in the JSON body sent to Pinch. Undefined = single-merchant.
+   */
+  merchantId?: string;
 }
 
 function validateInput(input: unknown): ValidatedInput | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return null;
   }
-  const { paymentId, transactionDate } = input as Record<string, unknown>;
+  const { paymentId, transactionDate, merchantId } = input as Record<
+    string,
+    unknown
+  >;
   if (typeof paymentId !== "string" || paymentId.trim() === "") {
     return null;
   }
   if (typeof transactionDate !== "string" || !isRealCalendarDate(transactionDate)) {
     return null;
   }
-  return { paymentId: paymentId.trim(), transactionDate };
+  const validated: ValidatedInput = {
+    paymentId: paymentId.trim(),
+    transactionDate,
+  };
+  if (merchantId !== undefined) {
+    if (typeof merchantId !== "string" || merchantId.trim() === "") {
+      return null;
+    }
+    validated.merchantId = merchantId.trim();
+  }
+  return validated;
 }
 
 /**
@@ -236,7 +254,11 @@ export async function POST(request: NextRequest) {
   const paymentPath = `payments/${encodeURIComponent(input.paymentId)}`;
 
   try {
-    const before = extractPayment(await pinchRequest<unknown>(paymentPath));
+    const before = extractPayment(
+      await pinchRequest<unknown>(paymentPath, {
+        merchantId: input.merchantId,
+      }),
+    );
     if (before === null) {
       return apiFailure("existing payment response did not match the documented shape.");
     }
@@ -268,9 +290,14 @@ export async function POST(request: NextRequest) {
     await pinchRequest<unknown>("payments", {
       method: "POST",
       body: updateBody,
+      merchantId: input.merchantId,
     });
 
-    const after = extractPayment(await pinchRequest<unknown>(paymentPath));
+    const after = extractPayment(
+      await pinchRequest<unknown>(paymentPath, {
+        merchantId: input.merchantId,
+      }),
+    );
     if (after === null) {
       return apiFailure("read-back response did not match the documented shape.");
     }
