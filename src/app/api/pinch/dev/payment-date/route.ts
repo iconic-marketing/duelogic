@@ -1,0 +1,319 @@
+import { type NextRequest, NextResponse } from "next/server";
+import {
+  PinchApiError,
+  PinchAuthError,
+  PinchConfigError,
+  pinchRequest,
+} from "@/lib/pinch/client";
+
+/**
+ * Development-only endpoint that moves the transaction date of an existing
+ * *scheduled* Pinch payment and reads it back to verify the change.
+ * Answers 404 unless the request arrives directly from localhost in
+ * `next dev` — the same gate as the dev payer route, copied verbatim.
+ */
+
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1"]);
+
+function hostHeaderIsLocal(hostHeader: string | null): boolean {
+  if (!hostHeader) {
+    return false;
+  }
+  const value = hostHeader.trim().toLowerCase();
+  if (value === "::1") {
+    // Bracket-less IPv6 loopback without a port cannot be URL-parsed below.
+    return true;
+  }
+  try {
+    // Handles ports and the bracketed IPv6 form, e.g. "[::1]:3000".
+    const hostname = new URL(`http://${value}`).hostname.replace(
+      /^\[|\]$/g,
+      "",
+    );
+    return LOCAL_HOSTNAMES.has(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackAddress(value: string): boolean {
+  const address = value.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (address === "::1" || address === "localhost") {
+    return true;
+  }
+  if (address.startsWith("::ffff:")) {
+    return isLoopbackAddress(address.slice("::ffff:".length));
+  }
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(address);
+}
+
+/**
+ * The Next dev server stamps x-forwarded-for/host/proto onto every request,
+ * including direct localhost ones (verified empirically), so rejecting on
+ * header *presence* would reject everything. Instead every forwarded value
+ * must itself be loopback/local: tunnels and proxies (ngrok, Vercel) put
+ * public hostnames, public client IPs, or https here, and are rejected.
+ */
+function isDirectLocalhostRequest(request: NextRequest): boolean {
+  if (process.env.NODE_ENV !== "development") {
+    return false;
+  }
+
+  if (!hostHeaderIsLocal(request.headers.get("host"))) {
+    return false;
+  }
+
+  const forwardedHost = request.headers.get("x-forwarded-host");
+  if (forwardedHost !== null && !hostHeaderIsLocal(forwardedHost)) {
+    return false;
+  }
+
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  if (forwardedFor !== null) {
+    const entries = forwardedFor
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== "");
+    if (entries.length === 0 || !entries.every(isLoopbackAddress)) {
+      return false;
+    }
+  }
+
+  // `next dev` serves plain http; a forwarded https proto indicates a tunnel.
+  const forwardedProto = request.headers.get("x-forwarded-proto");
+  if (forwardedProto !== null) {
+    const firstProto = forwardedProto.split(",")[0]?.trim().toLowerCase();
+    if (firstProto !== "http") {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function isRealCalendarDate(value: string): boolean {
+  if (!DATE_ONLY_PATTERN.test(value)) {
+    return false;
+  }
+  const [year, month, day] = value.split("-").map(Number);
+  if (month < 1 || month > 12) {
+    return false;
+  }
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return day >= 1 && day <= daysInMonth;
+}
+
+/**
+ * Normalises a Pinch transactionDate to its YYYY-MM-DD calendar date.
+ * Pinch may return a bare date, a zoneless datetime, or a UTC/offset
+ * timestamp (e.g. "2021-04-25T14:00:00.0000000Z"). For zoned timestamps the
+ * instant is converted to this machine's local timezone — the merchant's own
+ * timezone in local development — so midnight-in-Australia stored as UTC
+ * still resolves to the intended calendar day.
+ */
+function calendarDateOf(value: string): string | null {
+  const trimmed = value.trim();
+  const leading = /^(\d{4}-\d{2}-\d{2})(?:$|[T ])/.exec(trimmed);
+  if (!leading) {
+    return null;
+  }
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed);
+  if (!hasZone) {
+    return leading[1];
+  }
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) {
+    return leading[1];
+  }
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+interface ValidatedInput {
+  paymentId: string;
+  transactionDate: string;
+}
+
+function validateInput(input: unknown): ValidatedInput | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return null;
+  }
+  const { paymentId, transactionDate } = input as Record<string, unknown>;
+  if (typeof paymentId !== "string" || paymentId.trim() === "") {
+    return null;
+  }
+  if (typeof transactionDate !== "string" || !isRealCalendarDate(transactionDate)) {
+    return null;
+  }
+  return { paymentId: paymentId.trim(), transactionDate };
+}
+
+/**
+ * The documented GET /payments/{id} response fields this route relies on.
+ * The payer ID is nested at payer.id — the payment object has no top-level
+ * payerId field.
+ */
+interface PaymentSnapshot {
+  id: string;
+  payerId: string;
+  amount: number;
+  transactionDate: string;
+  description?: string;
+  status: string;
+}
+
+function extractPayment(result: unknown): PaymentSnapshot | null {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    return null;
+  }
+  const record = result as Record<string, unknown>;
+  const { id, amount, transactionDate, status, description, payer } = record;
+
+  if (typeof id !== "string" || id.trim() === "") {
+    return null;
+  }
+  if (typeof amount !== "number" || !Number.isFinite(amount)) {
+    return null;
+  }
+  if (typeof transactionDate !== "string" || calendarDateOf(transactionDate) === null) {
+    return null;
+  }
+  if (typeof status !== "string" || status.trim() === "") {
+    return null;
+  }
+  if (typeof payer !== "object" || payer === null || Array.isArray(payer)) {
+    return null;
+  }
+  const payerId = (payer as Record<string, unknown>).id;
+  if (typeof payerId !== "string" || payerId.trim() === "") {
+    return null;
+  }
+
+  const snapshot: PaymentSnapshot = {
+    id,
+    payerId,
+    amount,
+    transactionDate,
+    status,
+  };
+  if (typeof description === "string" && description !== "") {
+    snapshot.description = description;
+  }
+  return snapshot;
+}
+
+function apiFailure(reason: string): NextResponse {
+  console.error(`Pinch dev payment-date update failed at stage "api": ${reason}`);
+  return NextResponse.json({ ok: false, stage: "api" }, { status: 502 });
+}
+
+export async function POST(request: NextRequest) {
+  if (!isDirectLocalhostRequest(request)) {
+    return new NextResponse(null, { status: 404 });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await request.text());
+  } catch {
+    return NextResponse.json(
+      { ok: false, stage: "validation" },
+      { status: 400 },
+    );
+  }
+  const input = validateInput(parsed);
+  if (input === null) {
+    return NextResponse.json(
+      { ok: false, stage: "validation" },
+      { status: 400 },
+    );
+  }
+
+  const paymentPath = `payments/${encodeURIComponent(input.paymentId)}`;
+
+  try {
+    const before = extractPayment(await pinchRequest<unknown>(paymentPath));
+    if (before === null) {
+      return apiFailure("existing payment response did not match the documented shape.");
+    }
+    if (before.id !== input.paymentId) {
+      return apiFailure("existing payment response ID did not match the requested payment.");
+    }
+    if (before.status.toLowerCase() !== "scheduled") {
+      return apiFailure(`payment is not updatable: status is "${before.status}".`);
+    }
+
+    const previousTransactionDate = calendarDateOf(before.transactionDate);
+
+    // Documented update contract: POST /payments with the existing id plus
+    // the required payerId/amount/transactionDate, preserving everything but
+    // the date. Built explicitly — caller fields are never forwarded.
+    const updateBody: Record<string, unknown> = {
+      id: before.id,
+      payerId: before.payerId,
+      amount: before.amount,
+      transactionDate: input.transactionDate,
+    };
+    if (before.description !== undefined) {
+      updateBody.description = before.description;
+    }
+
+    // Issued exactly once. The response shape is deliberately ignored — the
+    // read-back GET below is the source of truth, so an unexpected success
+    // shape never triggers a second POST.
+    await pinchRequest<unknown>("payments", {
+      method: "POST",
+      body: updateBody,
+    });
+
+    const after = extractPayment(await pinchRequest<unknown>(paymentPath));
+    if (after === null) {
+      return apiFailure("read-back response did not match the documented shape.");
+    }
+
+    const failedChecks = [
+      after.id !== input.paymentId && "payment ID changed",
+      calendarDateOf(after.transactionDate) !== input.transactionDate &&
+        "transaction date does not match the requested date",
+      after.status.toLowerCase() !== "scheduled" && "status is no longer scheduled",
+      after.amount !== before.amount && "amount changed",
+      after.payerId !== before.payerId && "payer changed",
+    ].filter((check): check is string => typeof check === "string");
+
+    if (failedChecks.length > 0) {
+      return apiFailure(`read-back verification failed: ${failedChecks.join("; ")}.`);
+    }
+
+    return NextResponse.json({
+      ok: true,
+      paymentId: after.id,
+      previousTransactionDate,
+      transactionDate: input.transactionDate,
+      status: after.status,
+    });
+  } catch (error) {
+    const stage =
+      error instanceof PinchAuthError || error instanceof PinchConfigError
+        ? "auth"
+        : "api";
+
+    // Dev-only, localhost-only route: log the full upstream error body to
+    // the local console for debugging. It never enters the HTTP response.
+    console.error(`Pinch dev payment-date update failed at stage "${stage}".`, {
+      errorClass: error instanceof Error ? error.name : "UnknownError",
+      upstreamStatus:
+        error instanceof PinchAuthError || error instanceof PinchApiError
+          ? (error.status ?? "none")
+          : "none",
+      upstreamBody:
+        error instanceof PinchApiError ? (error.upstreamBody ?? "none") : "none",
+    });
+
+    const httpStatus = error instanceof PinchConfigError ? 500 : 502;
+    return NextResponse.json({ ok: false, stage }, { status: httpStatus });
+  }
+}
