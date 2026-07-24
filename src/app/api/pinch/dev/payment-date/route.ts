@@ -1,4 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server";
+import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
 import {
   PinchApiError,
   PinchAuthError,
@@ -10,86 +11,8 @@ import {
  * Development-only endpoint that moves the transaction date of an existing
  * *scheduled* Pinch payment and reads it back to verify the change.
  * Answers 404 unless the request arrives directly from localhost in
- * `next dev` — the same gate as the dev payer route, copied verbatim.
+ * `next dev` — the shared guard in src/lib/dev/localhost-guard.ts.
  */
-
-const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1"]);
-
-function hostHeaderIsLocal(hostHeader: string | null): boolean {
-  if (!hostHeader) {
-    return false;
-  }
-  const value = hostHeader.trim().toLowerCase();
-  if (value === "::1") {
-    // Bracket-less IPv6 loopback without a port cannot be URL-parsed below.
-    return true;
-  }
-  try {
-    // Handles ports and the bracketed IPv6 form, e.g. "[::1]:3000".
-    const hostname = new URL(`http://${value}`).hostname.replace(
-      /^\[|\]$/g,
-      "",
-    );
-    return LOCAL_HOSTNAMES.has(hostname);
-  } catch {
-    return false;
-  }
-}
-
-function isLoopbackAddress(value: string): boolean {
-  const address = value.trim().toLowerCase().replace(/^\[|\]$/g, "");
-  if (address === "::1" || address === "localhost") {
-    return true;
-  }
-  if (address.startsWith("::ffff:")) {
-    return isLoopbackAddress(address.slice("::ffff:".length));
-  }
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(address);
-}
-
-/**
- * The Next dev server stamps x-forwarded-for/host/proto onto every request,
- * including direct localhost ones (verified empirically), so rejecting on
- * header *presence* would reject everything. Instead every forwarded value
- * must itself be loopback/local: tunnels and proxies (ngrok, Vercel) put
- * public hostnames, public client IPs, or https here, and are rejected.
- */
-function isDirectLocalhostRequest(request: NextRequest): boolean {
-  if (process.env.NODE_ENV !== "development") {
-    return false;
-  }
-
-  if (!hostHeaderIsLocal(request.headers.get("host"))) {
-    return false;
-  }
-
-  const forwardedHost = request.headers.get("x-forwarded-host");
-  if (forwardedHost !== null && !hostHeaderIsLocal(forwardedHost)) {
-    return false;
-  }
-
-  const forwardedFor = request.headers.get("x-forwarded-for");
-  if (forwardedFor !== null) {
-    const entries = forwardedFor
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry !== "");
-    if (entries.length === 0 || !entries.every(isLoopbackAddress)) {
-      return false;
-    }
-  }
-
-  // `next dev` serves plain http; a forwarded https proto indicates a tunnel.
-  const forwardedProto = request.headers.get("x-forwarded-proto");
-  if (forwardedProto !== null) {
-    const firstProto = forwardedProto.split(",")[0]?.trim().toLowerCase();
-    if (firstProto !== "http") {
-      return false;
-    }
-  }
-
-  return true;
-}
 
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
