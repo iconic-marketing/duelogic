@@ -73,6 +73,17 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - The managed sandbox merchant timezone is `Australia/Sydney`.
 - Production code must use `Merchant.timezone`, never a hard-coded constant or the server's own timezone.
 
+## Subscription replacement rules
+
+- Permanent schedule correction follows preview, explicit confirmation, cancellation, then replacement.
+- A customer free-text request alone is insufficient authority to cancel a subscription. The customer must confirm the actual future dates and amounts.
+- Pinch subscription replacement is not atomic: `DELETE /subscriptions/{id}` and `POST /subscriptions` are separate mutations.
+- Never retry cancellation or creation after an ambiguous mutation response.
+- A failure after verified cancellation requires manual recovery; report it, never guess or retry.
+- A repeat call using the cancelled subscription ID must fail in preflight and must not create another replacement.
+- A production implementation requires durable operation state before executing a replacement.
+- The hackathon replacement route is localhost-only proof code, not a production transaction coordinator.
+
 ## Outcome events
 
 The proven payment lifecycle events are:
