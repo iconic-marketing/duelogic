@@ -1,5 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { type NextRequest, NextResponse } from "next/server";
+import {
+  isOutcomeEventType,
+  recordOutcomeEvent,
+} from "@/lib/pinch/dev-outcome-store";
 
 /**
  * Public Pinch webhook receiver.
@@ -7,8 +11,10 @@ import { type NextRequest, NextResponse } from "next/server";
  * Verifies the `pinch-signature` header (t=<unix seconds>,v2=<hex HMAC>)
  * against the raw request body before any parsing: the signed value is
  * "<timestamp>.<raw body>", HMAC-SHA256 keyed with PINCH_WEBHOOK_SECRET,
- * compared as lowercase hex via a constant-time comparison. Events are
- * acknowledged only; nothing is stored yet.
+ * compared as lowercase hex via a constant-time comparison. After
+ * verification, scheduled-process and bank-results events have a safe
+ * summary recorded in the development outcome store (a no-op outside
+ * `next dev`); nothing else is stored.
  */
 
 export const runtime = "nodejs";
@@ -194,6 +200,25 @@ export async function POST(request: NextRequest) {
     ...(event.eventDate !== undefined ? { eventDate: event.eventDate } : {}),
     paymentIds: event.paymentIds,
   });
+
+  // Reached only after signature, timestamp and JSON verification. Only the
+  // whitelisted summary fields are passed on — never the body or signature.
+  // Unsupported event types are acknowledged but not stored; the store itself
+  // deduplicates by event ID, so webhook redelivery cannot double-record.
+  if (isOutcomeEventType(event.type)) {
+    try {
+      recordOutcomeEvent(
+        { eventId: event.id, type: event.type, eventDate: event.eventDate },
+        event.paymentIds,
+      );
+    } catch {
+      // The dev store must never change the webhook response contract.
+      console.error(
+        "Pinch webhook: could not record the dev outcome summary.",
+        { id: event.id, type: event.type },
+      );
+    }
+  }
 
   return NextResponse.json({ ok: true });
 }

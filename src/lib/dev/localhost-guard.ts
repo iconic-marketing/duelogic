@@ -53,28 +53,36 @@ function isLoopbackAddress(value: string): boolean {
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(address);
 }
 
+/** Minimal read surface shared by NextRequest.headers and next/headers. */
+interface HeaderReader {
+  get(name: string): string | null;
+}
+
 /**
  * The Next dev server stamps x-forwarded-for/host/proto onto every request,
  * including direct localhost ones (verified empirically), so rejecting on
  * header *presence* would reject everything. Instead every forwarded value
  * must itself be loopback/local: tunnels and proxies (ngrok, Vercel) put
  * public hostnames, public client IPs, or https here, and are rejected.
+ *
+ * Accepts a plain header reader so server components (via `await headers()`)
+ * and API routes (via `request.headers`) apply the identical checks.
  */
-export function isDirectLocalhostRequest(request: NextRequest): boolean {
+export function areLocalhostRequestHeaders(headers: HeaderReader): boolean {
   if (process.env.NODE_ENV !== "development") {
     return false;
   }
 
-  if (!hostHeaderIsLocal(request.headers.get("host"))) {
+  if (!hostHeaderIsLocal(headers.get("host"))) {
     return false;
   }
 
-  const forwardedHost = request.headers.get("x-forwarded-host");
+  const forwardedHost = headers.get("x-forwarded-host");
   if (forwardedHost !== null && !hostHeaderIsLocal(forwardedHost)) {
     return false;
   }
 
-  const forwardedFor = request.headers.get("x-forwarded-for");
+  const forwardedFor = headers.get("x-forwarded-for");
   if (forwardedFor !== null) {
     const entries = forwardedFor
       .split(",")
@@ -86,7 +94,7 @@ export function isDirectLocalhostRequest(request: NextRequest): boolean {
   }
 
   // `next dev` serves plain http; a forwarded https proto indicates a tunnel.
-  const forwardedProto = request.headers.get("x-forwarded-proto");
+  const forwardedProto = headers.get("x-forwarded-proto");
   if (forwardedProto !== null) {
     const firstProto = forwardedProto.split(",")[0]?.trim().toLowerCase();
     if (firstProto !== "http") {
@@ -95,4 +103,8 @@ export function isDirectLocalhostRequest(request: NextRequest): boolean {
   }
 
   return true;
+}
+
+export function isDirectLocalhostRequest(request: NextRequest): boolean {
+  return areLocalhostRequestHeaders(request.headers);
 }

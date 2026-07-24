@@ -8,10 +8,12 @@ import {
 } from "@/lib/pinch/client";
 
 /**
- * Development-only endpoint that moves the transaction date of an existing
- * *scheduled* Pinch payment and reads it back to verify the change.
- * Answers 404 unless the request arrives directly from localhost in
- * `next dev` — the shared guard in src/lib/dev/localhost-guard.ts.
+ * Development-only endpoint for one managed scheduled Pinch payment:
+ * POST moves its transaction date and reads it back to verify the change;
+ * GET returns a safe summary of the payment (no source, attempts, fees or
+ * payer contact data). Answers 404 unless the request arrives directly from
+ * localhost in `next dev` — the shared guard in
+ * src/lib/dev/localhost-guard.ts.
  */
 
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -54,6 +56,15 @@ function calendarDateOf(value: string): string | null {
   const month = String(parsed.getMonth() + 1).padStart(2, "0");
   const day = String(parsed.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+/** Trimmed non-empty string carrying the expected Pinch ID prefix, else null. */
+function prefixedId(value: unknown, prefix: string): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.startsWith(prefix) && trimmed !== "" ? trimmed : null;
 }
 
 interface ValidatedInput {
@@ -261,6 +272,100 @@ export async function POST(request: NextRequest) {
           ? (error.status ?? "none")
           : "none",
       paymentId: input.paymentId,
+    });
+
+    const httpStatus = error instanceof PinchConfigError ? 500 : 502;
+    return NextResponse.json({ ok: false, stage }, { status: httpStatus });
+  }
+}
+
+function readFailure(reason: string): NextResponse {
+  console.error(`Pinch dev payment read failed at stage "api": ${reason}`);
+  return NextResponse.json({ ok: false, stage: "api" }, { status: 502 });
+}
+
+/**
+ * Localhost-only read of one payment, scoped to a managed merchant.
+ * Query: merchantId (mch_…) and paymentId (pmt_…), nothing else. Returns a
+ * safe summary only — integer-cent amount, normalised calendar date, status,
+ * payer ID and optional description. No source data, attempts, fees or
+ * complete Pinch objects.
+ */
+export async function GET(request: NextRequest) {
+  if (!isDirectLocalhostRequest(request)) {
+    return new NextResponse(null, { status: 404 });
+  }
+
+  const searchParams = request.nextUrl.searchParams;
+  for (const key of searchParams.keys()) {
+    if (key !== "merchantId" && key !== "paymentId") {
+      return NextResponse.json(
+        { ok: false, stage: "validation" },
+        { status: 400 },
+      );
+    }
+  }
+  const merchantId = prefixedId(searchParams.get("merchantId"), "mch_");
+  const paymentId = prefixedId(searchParams.get("paymentId"), "pmt_");
+  if (
+    merchantId === null ||
+    paymentId === null ||
+    searchParams.getAll("merchantId").length !== 1 ||
+    searchParams.getAll("paymentId").length !== 1
+  ) {
+    return NextResponse.json(
+      { ok: false, stage: "validation" },
+      { status: 400 },
+    );
+  }
+
+  try {
+    const payment = extractPayment(
+      await pinchRequest<unknown>(
+        `payments/${encodeURIComponent(paymentId)}`,
+        { merchantId },
+      ),
+    );
+    if (payment === null) {
+      return readFailure("payment response did not match the documented shape.");
+    }
+    if (payment.id !== paymentId) {
+      return readFailure("payment response ID did not match the requested payment.");
+    }
+    const transactionDate = calendarDateOf(payment.transactionDate);
+    if (transactionDate === null) {
+      return readFailure("payment transaction date could not be normalised.");
+    }
+
+    // Built field-by-field; `amount` is already integer cents and is passed
+    // through unconverted as amountCents.
+    const summary: Record<string, unknown> = {
+      id: payment.id,
+      payerId: payment.payerId,
+      amountCents: payment.amount,
+      transactionDate,
+      status: payment.status,
+    };
+    if (payment.description !== undefined) {
+      summary.description = payment.description;
+    }
+    return NextResponse.json({ ok: true, merchantId, payment: summary });
+  } catch (error) {
+    const stage =
+      error instanceof PinchAuthError || error instanceof PinchConfigError
+        ? "auth"
+        : "api";
+
+    // Never log upstream response bodies: Pinch error bodies can carry
+    // tokenised source details and payer PII. Log only classification
+    // fields and the safe payment identifier already supplied by the caller.
+    console.error(`Pinch dev payment read failed at stage "${stage}".`, {
+      errorClass: error instanceof Error ? error.name : "UnknownError",
+      upstreamStatus:
+        error instanceof PinchAuthError || error instanceof PinchApiError
+          ? (error.status ?? "none")
+          : "none",
+      paymentId,
     });
 
     const httpStatus = error instanceof PinchConfigError ? 500 : 502;

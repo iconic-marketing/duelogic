@@ -101,6 +101,18 @@ The webhook receiver:
 - must remain publicly reachable
 - must never log secrets, signatures or complete webhook bodies
 
+## Local live-payment screen
+
+- `/dev/pinch/payment` is the minimum visible Pinch execution proof: a localhost-only development screen over the proven payment-date routes and webhook.
+- Payment state shown on the screen must be read from Pinch through the dev read endpoint, never hardcoded.
+- Only webhook events that passed signature, timestamp and JSON verification may enter the development outcome store (`src/lib/pinch/dev-outcome-store.ts`).
+- The development outcome store holds safe summaries only: paymentId, eventId, type, eventDate, receivedAt. Never bodies, signatures, headers, amounts, payer or source data.
+- The store is in-process memory, deduplicated by event ID, capped at 10 events per payment, and resets on process restart. It is not persistence.
+- `scheduled-process` means processing started.
+- `bank-results` means a result event arrived; the current payment status from the read endpoint remains the outcome source of truth.
+- A failed payment-date mutation must never be automatically repeated.
+- The date-change confirmation is temporary operation feedback, not payment state: it is cleared once a later webhook event arrives or the payment is no longer scheduled, and the move controls are disabled whenever the current Pinch status is not scheduled.
+
 ## DueLogic analysis rules
 
 - Pattern detection filters to dishonours with the `insufficient-funds` reason only.
