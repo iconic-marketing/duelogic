@@ -46,8 +46,10 @@ export class PinchApiError extends PinchError {
     message: string,
     public readonly status?: number,
     /**
-     * Raw upstream error response body, retained for local diagnostics only.
-     * Never include it in error messages or public HTTP responses.
+     * Raw upstream error response body, retained for in-process inspection
+     * only (e.g. nonce-replay detection). It can contain tokenised source
+     * data and payer PII: never log it and never include it in error
+     * messages or HTTP responses.
      */
     public readonly upstreamBody?: string,
   ) {

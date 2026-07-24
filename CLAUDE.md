@@ -55,6 +55,14 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - Change only the approved field.
 - Read the payment back after mutation and verify the new value before returning success.
 
+## Nonce replay contract
+
+- Reusing a Pinch payment nonce on `POST /payments` returns HTTP 403 with `isNonceReplay: true` and the existing payment under `data`; `data.id` carries the original `pmt_` payment ID.
+- Treat a verified nonce replay as an idempotent success only after the normal `GET /payments/{paymentId}` read-back verification passes.
+- Never repeat `POST /payments` after a nonce replay or an ambiguous mutation response.
+- Pinch error bodies can contain tokenised payment-source data and payer personally identifiable information. Never log or return complete upstream bodies; log only route or operation, stage, error class, upstream HTTP status and safe identifiers.
+- The payment read response may expose source identity at `attempts[].source.id` (proven live), as well as possibly `sourceId` or `source.id`. Do not probe other shapes.
+
 ## Outcome events
 
 The proven payment lifecycle events are:

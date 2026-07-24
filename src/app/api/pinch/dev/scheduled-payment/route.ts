@@ -67,6 +67,10 @@ function prefixedId(value: unknown, prefix: string): string | null {
   return trimmed.startsWith(prefix) && trimmed !== "" ? trimmed : null;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 interface ValidatedInput {
   /**
    * Passed only via the pinchRequest option (the Current-Merchant header),
@@ -152,6 +156,62 @@ function validateInput(input: unknown): ValidatedInput | null {
 }
 
 /**
+ * Recognises the empirically proven Pinch nonce-replay rejection: repeating
+ * POST /payments with an already-used nonce returns HTTP 403 whose JSON body
+ * carries `isNonceReplay: true` and the existing payment under `data`, with
+ * `data.id` holding the original pmt_ payment ID.
+ *
+ * Only `data.id` is extracted. The replay body can contain tokenised source
+ * details and payer PII, so no other field of it is trusted, kept or logged —
+ * the payment fields returned to the caller come solely from the GET
+ * read-back that follows.
+ *
+ * Returns the existing payment ID for a valid replay, else null (in which
+ * case the 403 remains an ordinary API failure).
+ */
+function extractNonceReplayPaymentId(
+  upstreamBody: string | undefined,
+  nonce: string,
+): string | null {
+  if (upstreamBody === undefined) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(upstreamBody);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed) || parsed.isNonceReplay !== true) {
+    return null;
+  }
+  const data = parsed.data;
+  if (!isPlainObject(data)) {
+    return null;
+  }
+  const paymentId = prefixedId(data.id, "pmt_");
+  if (paymentId === null) {
+    return null;
+  }
+
+  // Every nonce field present in the body must equal the caller-supplied
+  // trimmed nonce, and at least one must be present — otherwise the 403 is
+  // not proven to be a replay of *this* request.
+  const nonceValues = [parsed.stringNonce, parsed.nonce, data.nonce].filter(
+    (value) => value !== undefined,
+  );
+  if (nonceValues.length === 0) {
+    return null;
+  }
+  for (const value of nonceValues) {
+    if (typeof value !== "string" || value.trim() !== nonce) {
+      return null;
+    }
+  }
+  return paymentId;
+}
+
+/**
  * The creation response may be a full payment object or a bare ID string
  * (the Pinch client already tolerates plain-text success bodies).
  */
@@ -182,12 +242,13 @@ interface PaymentSnapshot {
   description?: string;
   status: string;
   /**
-   * Present only when the read response exposes a source identifier — a
-   * top-level `sourceId` string or a nested `source.id`. The documented
-   * shape verified elsewhere does not include one, so source identity is
-   * checked opportunistically rather than assuming a response shape.
+   * Every source identifier the read response exposes: top-level `sourceId`,
+   * nested `source.id`, and `attempts[].source.id` (the location proven by
+   * the live sandbox response). Empty when the response exposes none, in
+   * which case source verification is skipped rather than inventing a
+   * failure. No other shapes are probed.
    */
-  sourceId?: string;
+  sourceIds: string[];
 }
 
 function extractPayment(result: unknown): PaymentSnapshot | null {
@@ -217,29 +278,34 @@ function extractPayment(result: unknown): PaymentSnapshot | null {
     return null;
   }
 
+  const sourceIds: string[] = [];
+  const collectSourceId = (value: unknown): void => {
+    if (typeof value === "string" && value.trim() !== "") {
+      sourceIds.push(value.trim());
+    }
+  };
+  collectSourceId(record.sourceId);
+  if (isPlainObject(record.source)) {
+    collectSourceId(record.source.id);
+  }
+  if (Array.isArray(record.attempts)) {
+    for (const attempt of record.attempts) {
+      if (isPlainObject(attempt) && isPlainObject(attempt.source)) {
+        collectSourceId(attempt.source.id);
+      }
+    }
+  }
+
   const snapshot: PaymentSnapshot = {
     id,
     payerId,
     amount,
     transactionDate,
     status,
+    sourceIds,
   };
   if (typeof description === "string" && description !== "") {
     snapshot.description = description;
-  }
-
-  const rawSourceId = record.sourceId;
-  if (typeof rawSourceId === "string" && rawSourceId.trim() !== "") {
-    snapshot.sourceId = rawSourceId.trim();
-  } else if (
-    typeof record.source === "object" &&
-    record.source !== null &&
-    !Array.isArray(record.source)
-  ) {
-    const nestedId = (record.source as Record<string, unknown>).id;
-    if (typeof nestedId === "string" && nestedId.trim() !== "") {
-      snapshot.sourceId = nestedId.trim();
-    }
   }
   return snapshot;
 }
@@ -289,22 +355,47 @@ export async function POST(request: NextRequest) {
       createBody.description = input.description;
     }
 
-    // The one and only creation mutation. Never retried at route level — an
-    // ambiguous result fails below instead of POSTing again (pinchRequest's
+    // The one and only creation mutation. Never repeated at route level —
+    // whatever comes back (success, nonce replay, ambiguity or error), no
+    // second POST /payments is ever issued for this request (pinchRequest's
     // single refresh-and-retry after an explicit HTTP 401 is the only
     // permitted retry).
-    const created = await pinchRequest<unknown>("payments", {
-      method: "POST",
-      body: createBody,
-      merchantId: input.merchantId,
-    });
+    let paymentId: string;
+    let idempotentReplay = false;
+    try {
+      const created = await pinchRequest<unknown>("payments", {
+        method: "POST",
+        body: createBody,
+        merchantId: input.merchantId,
+      });
 
-    const paymentId = extractPaymentId(created);
-    if (paymentId === null) {
-      // Upstream reported success, so the payment likely exists; do not
-      // retry the POST, as that could schedule a duplicate payment.
-      return apiFailure(
-        "upstream reported success but no payment ID could be extracted.",
+      const extracted = extractPaymentId(created);
+      if (extracted === null) {
+        // Upstream reported success, so the payment likely exists; do not
+        // retry the POST, as that could schedule a duplicate payment.
+        return apiFailure(
+          "upstream reported success but no payment ID could be extracted.",
+        );
+      }
+      paymentId = extracted;
+    } catch (error) {
+      // Proven contract: reusing a nonce returns HTTP 403 with
+      // isNonceReplay: true and the existing payment under data. A valid
+      // replay resolves to the original payment and flows into the same
+      // read-back verification below; a 403 that fails any replay check —
+      // and every other error — stays an error via the outer catch.
+      const replayPaymentId =
+        error instanceof PinchApiError && error.status === 403
+          ? extractNonceReplayPaymentId(error.upstreamBody, input.nonce)
+          : null;
+      if (replayPaymentId === null) {
+        throw error;
+      }
+      paymentId = replayPaymentId;
+      idempotentReplay = true;
+      console.log(
+        "Pinch dev scheduled-payment creation: valid nonce replay detected; verifying the existing payment.",
+        { paymentId, merchantId: input.merchantId },
       );
     }
 
@@ -326,9 +417,10 @@ export async function POST(request: NextRequest) {
         "transaction date does not match",
       readBack.status.toLowerCase() !== "scheduled" &&
         `status is "${readBack.status}", not scheduled`,
-      // Verified only when the read response exposed a source identifier.
-      readBack.sourceId !== undefined &&
-        readBack.sourceId !== input.sourceId &&
+      // Verified only when the read response exposed source identifiers:
+      // the requested source must then be among them.
+      readBack.sourceIds.length > 0 &&
+        !readBack.sourceIds.includes(input.sourceId) &&
         "source does not match",
     ].filter((check): check is string => typeof check === "string");
 
@@ -341,6 +433,7 @@ export async function POST(request: NextRequest) {
     const responseBody: Record<string, unknown> = {
       ok: true,
       paymentId,
+      idempotentReplay,
       merchantId: input.merchantId,
       payerId: input.payerId,
       sourceId: input.sourceId,
@@ -359,8 +452,9 @@ export async function POST(request: NextRequest) {
         ? "auth"
         : "api";
 
-    // Dev-only, localhost-only route: log the full upstream error body to
-    // the local console for debugging. It never enters the HTTP response.
+    // Never log upstream response bodies: Pinch error bodies can carry
+    // tokenised source details and payer PII. Log only classification
+    // fields and safe identifiers already supplied by the caller.
     console.error(
       `Pinch dev scheduled-payment creation failed at stage "${stage}".`,
       {
@@ -369,10 +463,8 @@ export async function POST(request: NextRequest) {
           error instanceof PinchAuthError || error instanceof PinchApiError
             ? (error.status ?? "none")
             : "none",
-        upstreamBody:
-          error instanceof PinchApiError
-            ? (error.upstreamBody ?? "none")
-            : "none",
+        merchantId: input.merchantId,
+        payerId: input.payerId,
       },
     );
 

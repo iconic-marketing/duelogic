@@ -147,17 +147,15 @@ export async function POST(request: NextRequest) {
         ? "auth"
         : "api";
 
-    // Dev-only, localhost-only route: log the full upstream error body to
-    // the local console for debugging. It never enters the HTTP response,
-    // and the submitted payer body is never logged.
+    // Never log upstream response bodies: Pinch error bodies can carry
+    // tokenised source details and payer PII. The submitted payer body is
+    // never logged either — only classification fields.
     console.error(`Pinch dev payer creation failed at stage "${stage}".`, {
       errorClass: error instanceof Error ? error.name : "UnknownError",
       upstreamStatus:
         error instanceof PinchAuthError || error instanceof PinchApiError
           ? (error.status ?? "none")
           : "none",
-      upstreamBody:
-        error instanceof PinchApiError ? (error.upstreamBody ?? "none") : "none",
     });
 
     const httpStatus = error instanceof PinchConfigError ? 500 : 502;
