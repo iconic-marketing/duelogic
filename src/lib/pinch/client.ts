@@ -13,27 +13,47 @@ const PINCH_VERSION = "2020.1";
 // that is about to lapse is never used for an outgoing request.
 const TOKEN_EXPIRY_MARGIN_SECONDS = 60;
 
-export class PinchError extends Error {}
+export class PinchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
 
 /** Server misconfiguration: required environment variables are missing. */
 export class PinchConfigError extends PinchError {}
 
-/** The OAuth token request to Pinch failed. */
-export class PinchAuthError extends PinchError {}
+/**
+ * A token could not be obtained (initial acquisition or refresh).
+ * `status` is the token endpoint's HTTP status, when one was received.
+ */
+export class PinchAuthError extends PinchError {
+  constructor(
+    message: string,
+    public readonly status?: number,
+  ) {
+    super(message);
+  }
+}
 
-/** A Pinch API request failed after authentication succeeded. */
+/**
+ * A token was obtained, but the authenticated Pinch API request failed
+ * (after the built-in 401 refresh-and-retry). `status` is the upstream HTTP
+ * status, when one was received; it is undefined for network-level failures.
+ */
 export class PinchApiError extends PinchError {
   constructor(
     message: string,
-    public readonly status: number,
+    public readonly status?: number,
   ) {
     super(message);
   }
 }
 
 // The `server-only` package is not installed in this project, so guard at
-// runtime instead: importing this module into browser code fails immediately
-// rather than silently bundling credentials.
+// runtime instead. Called at module scope below so that importing this module
+// into browser code fails at import time, and again inside each entry point
+// in case the module-scope check is ever tree-shaken away.
 function assertServer(): void {
   if (typeof window !== "undefined") {
     throw new PinchError(
@@ -41,6 +61,8 @@ function assertServer(): void {
     );
   }
 }
+
+assertServer();
 
 interface PinchConfig {
   appId: string;
@@ -108,6 +130,7 @@ async function requestToken(): Promise<CachedToken> {
   if (!response.ok) {
     throw new PinchAuthError(
       `Pinch token request failed with HTTP ${response.status}. Check the Pinch application credentials.`,
+      response.status,
     );
   }
 
@@ -163,6 +186,11 @@ export interface PinchRequestOptions {
   body?: unknown;
   /** Appended to the URL as a query string; undefined values are skipped. */
   searchParams?: Record<string, string | number | boolean | undefined>;
+  /**
+   * Scopes the request to a managed merchant via the Current-Merchant
+   * header. Omit for single-merchant (own-account) requests.
+   */
+  merchantId?: string;
 }
 
 /**
@@ -188,20 +216,27 @@ export async function pinchRequest<T>(
   const safePath = `${path.replace(/^\/+/, "")}${queryString}`;
 
   const performRequest = async (token: string): Promise<Response> => {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+      "pinch-version": PINCH_VERSION,
+    };
+    if (options.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
+    if (options.merchantId !== undefined) {
+      headers["Current-Merchant"] = options.merchantId;
+    }
+
     try {
       return await fetch(url, {
         method: options.method ?? "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "pinch-version": PINCH_VERSION,
-          "Content-Type": "application/json",
-        },
+        headers,
         body:
           options.body !== undefined ? JSON.stringify(options.body) : undefined,
         cache: "no-store",
       });
     } catch {
-      throw new PinchApiError(`Could not reach the Pinch API (${safePath}).`, 0);
+      throw new PinchApiError(`Could not reach the Pinch API (${safePath}).`);
     }
   };
 
