@@ -274,6 +274,10 @@ export interface CustomerInterventionProjection {
    * derived from the missing record, never hardcoded.
    */
   finalConfirmationEnabled: boolean;
+  /** Present only after execution completed through a movement kind. */
+  executedMovementKind?: "temporary" | "permanent";
+  /** YYYY-MM-DD: the read-back-verified new date of a temporary movement. */
+  verifiedTemporaryTransactionDate?: string;
 }
 
 /**
@@ -339,6 +343,15 @@ export function toCustomerInterventionProjection(
       record.currentPayments !== null &&
       record.proposedPayments !== null &&
       verificationUsable,
+    ...(record.executedMovementKind !== undefined
+      ? { executedMovementKind: record.executedMovementKind }
+      : {}),
+    ...(record.verifiedTemporaryTransactionDate !== undefined
+      ? {
+          verifiedTemporaryTransactionDate:
+            record.verifiedTemporaryTransactionDate,
+        }
+      : {}),
   };
 }
 
@@ -366,6 +379,8 @@ export interface MerchantInterventionProjection {
   confirmationId: string | null;
   operationId: string | null;
   newSubscriptionId: string | null;
+  /** Present only after execution completed through a movement kind. */
+  executedMovementKind?: "temporary" | "permanent";
 }
 
 export function toMerchantInterventionProjection(
@@ -390,6 +405,9 @@ export function toMerchantInterventionProjection(
     confirmationId: record.confirmationId,
     operationId: record.operationId,
     newSubscriptionId: record.newSubscriptionId,
+    ...(record.executedMovementKind !== undefined
+      ? { executedMovementKind: record.executedMovementKind }
+      : {}),
   };
 }
 

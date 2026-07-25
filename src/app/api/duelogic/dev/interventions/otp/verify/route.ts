@@ -1,6 +1,10 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
 import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
+import { buildDevMovementProjectionDeps, buildDevTemporaryJourneyDeps } from "@/lib/duelogic/dev-movement-journey";
+import { getDevMovementChoiceRepository } from "@/lib/duelogic/dev-movement-store";
+import { buildCustomerMovementProjection } from "@/lib/duelogic/movement-journey";
+import { verifyTemporaryOtp } from "@/lib/duelogic/temporary-execution-service";
 import { getDevOtpChallengeRepository } from "@/lib/duelogic/dev-otp-store";
 import { getDevSmsStore } from "@/lib/duelogic/dev-sms-store";
 import { getDevTransactionVerificationRepository, generateTransactionVerificationId } from "@/lib/duelogic/dev-transaction-verification-store";
@@ -91,6 +95,67 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    // Movement dispatch: the STORED server-side choice — never the
+    // browser — decides which challenge kind is verified. A temporary
+    // choice verifies the temporary challenge and creates the temporary
+    // transaction verification; anything else keeps the existing
+    // permanent behaviour unchanged. Cross-kind reuse is impossible: each
+    // kind's expectation binds its own discriminated challenge.
+    const dispatchRecord = await getDevInterventionRepository().readByTokenHash(
+      hashInterventionToken(parsed.token.trim()),
+    );
+    if (dispatchRecord !== null) {
+      const choice = await getDevMovementChoiceRepository().readChoice(
+        dispatchRecord.interventionId,
+      );
+      if (choice?.kind === "temporary") {
+        const temporaryOutcome = await verifyTemporaryOtp(
+          { token: parsed.token, code: parsed.code },
+          await buildDevTemporaryJourneyDeps(),
+        );
+        const nowIsoTemporary = new Date().toISOString();
+        const movement = await buildCustomerMovementProjection(
+          dispatchRecord,
+          await buildDevMovementProjectionDeps(),
+        );
+        if (temporaryOutcome.ok) {
+          return NextResponse.json({
+            ok: true,
+            stage: "otp-verified",
+            temporaryStore: true,
+            movement,
+            intervention: toCustomerInterventionProjection(
+              dispatchRecord,
+              nowIsoTemporary,
+            ),
+          });
+        }
+        if (temporaryOutcome.reason === "not-found") {
+          return NextResponse.json(
+            { ok: false, stage: "not-found" },
+            { status: 404 },
+          );
+        }
+        const temporaryStatus =
+          temporaryOutcome.reason === "configuration-error" ||
+          temporaryOutcome.reason === "verification-store-failed"
+            ? 500
+            : 409;
+        return NextResponse.json(
+          {
+            ok: false,
+            stage: temporaryOutcome.reason,
+            movement,
+            intervention: toCustomerInterventionProjection(
+              dispatchRecord,
+              nowIsoTemporary,
+            ),
+          },
+          { status: temporaryStatus },
+        );
+      }
+    }
+
     const outcome = await verifyInterventionOtp(
       { token: parsed.token, code: parsed.code },
       {

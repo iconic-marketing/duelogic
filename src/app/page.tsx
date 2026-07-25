@@ -5,6 +5,7 @@ import {
   toMerchantInterventionProjection,
 } from "@/lib/duelogic/intervention";
 import { validateInterventionFlow } from "@/lib/duelogic/intervention-validation";
+import { validateMovementJourney } from "@/lib/duelogic/movement-availability-validation";
 import { validateOtpFlow } from "@/lib/duelogic/otp-validation";
 import { validateTemporaryOperations } from "@/lib/duelogic/temporary-operation-validation";
 import { validateTransactionVerification } from "@/lib/duelogic/transaction-verification-validation";
@@ -81,6 +82,7 @@ export default async function DashboardPage() {
   const verificationValidation = await validateTransactionVerification();
   const otpValidation = await validateOtpFlow();
   const temporaryOperationValidation = await validateTemporaryOperations();
+  const movementValidation = await validateMovementJourney();
 
   // Merchant policy state from the process-local development store:
   // merchant-safe projections only reach the client panel. The active
@@ -217,6 +219,7 @@ export default async function DashboardPage() {
         transaction-verification scenarios, {otpValidation.scenarioCount}{" "}
         customer OTP scenarios,{" "}
         {temporaryOperationValidation.scenarioCount} temporary-movement
+        scenarios, {movementValidation.scenarioCount} movement-journey
         scenarios.
       </footer>
     </main>

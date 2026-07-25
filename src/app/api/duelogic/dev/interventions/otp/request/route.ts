@@ -1,6 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
 import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
+import { buildDevTemporaryJourneyDeps } from "@/lib/duelogic/dev-movement-journey";
+import { getDevMovementChoiceRepository } from "@/lib/duelogic/dev-movement-store";
+import { requestTemporaryOtp } from "@/lib/duelogic/temporary-execution-service";
 import { getDevOtpChallengeRepository } from "@/lib/duelogic/dev-otp-store";
 import { getDevSmsStore } from "@/lib/duelogic/dev-sms-store";
 import { getDevTransactionVerificationRepository, generateTransactionVerificationId } from "@/lib/duelogic/dev-transaction-verification-store";
@@ -83,6 +86,63 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    // Movement dispatch: the STORED server-side choice — never the
+    // browser — decides which challenge kind is issued. A temporary
+    // choice issues the temporary challenge bound to the exact temporary
+    // operation selection; anything else keeps the existing permanent
+    // behaviour unchanged.
+    const dispatchRecord = await getDevInterventionRepository().readByTokenHash(
+      hashInterventionToken(parsed.token.trim()),
+    );
+    if (dispatchRecord !== null) {
+      const choice = await getDevMovementChoiceRepository().readChoice(
+        dispatchRecord.interventionId,
+      );
+      if (choice?.kind === "temporary") {
+        const temporaryOutcome = await requestTemporaryOtp(
+          { token: parsed.token },
+          await buildDevTemporaryJourneyDeps(),
+        );
+        const nowIsoTemporary = new Date().toISOString();
+        if (temporaryOutcome.ok) {
+          return NextResponse.json({
+            ok: true,
+            stage: "otp-sent",
+            temporaryStore: true,
+            maskedMobile: temporaryOutcome.maskedMobile,
+            expiresAt: temporaryOutcome.challengeExpiresAt,
+            intervention: toCustomerInterventionProjection(
+              dispatchRecord,
+              nowIsoTemporary,
+            ),
+          });
+        }
+        if (temporaryOutcome.reason === "not-found") {
+          return NextResponse.json(
+            { ok: false, stage: "not-found" },
+            { status: 404 },
+          );
+        }
+        const temporaryStatus =
+          temporaryOutcome.reason === "configuration-error" ||
+          temporaryOutcome.reason === "store-failed" ||
+          temporaryOutcome.reason === "delivery-failed"
+            ? 500
+            : 409;
+        return NextResponse.json(
+          {
+            ok: false,
+            stage: temporaryOutcome.reason,
+            intervention: toCustomerInterventionProjection(
+              dispatchRecord,
+              nowIsoTemporary,
+            ),
+          },
+          { status: temporaryStatus },
+        );
+      }
+    }
+
     const outcome = await requestInterventionOtp(
       { token: parsed.token },
       {

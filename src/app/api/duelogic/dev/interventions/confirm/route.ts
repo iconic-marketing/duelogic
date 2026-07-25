@@ -1,6 +1,13 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
 import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
+import { buildDevTemporaryJourneyDeps } from "@/lib/duelogic/dev-movement-journey";
+import { getDevMovementChoiceRepository } from "@/lib/duelogic/dev-movement-store";
+import {
+  dispatchFinalConfirmation,
+  resolveMovementKindForExecution,
+} from "@/lib/duelogic/movement-journey";
+import { executeTemporaryPaymentChange } from "@/lib/duelogic/temporary-execution-service";
 import { toCustomerInterventionProjection } from "@/lib/duelogic/intervention";
 import { getDevTransactionVerificationRepository } from "@/lib/duelogic/dev-transaction-verification-store";
 import { transactionVerificationExpectationFor } from "@/lib/duelogic/intervention";
@@ -181,6 +188,79 @@ export async function POST(request: NextRequest) {
     const verifications = getDevTransactionVerificationRepository();
     const nowClock = () => new Date().toISOString();
 
+    // Final-confirmation dispatch: the STORED server-side movement choice
+    // — never request data — selects exactly one protected execution
+    // path. Invitations that predate movement choices default to the
+    // permanent journey below, byte-for-byte unchanged.
+    const dispatchRecord = await interventionRepository.readByTokenHash(
+      hashInterventionToken(token.trim()),
+    );
+    if (dispatchRecord === null) {
+      return NextResponse.json(
+        { ok: false, stage: "not-found" },
+        { status: 404 },
+      );
+    }
+    const movementKind = await resolveMovementKindForExecution(
+      dispatchRecord.interventionId,
+      getDevMovementChoiceRepository(),
+    );
+    // One invocation of the protected temporary execution function — its
+    // own fresh authoritative payment read, atomic claim, confirmation,
+    // evidence-before-mutation, single mutation and read-back
+    // verification. Never retried.
+    const runTemporaryConfirmation = async (): Promise<NextResponse> => {
+          const outcome = await executeTemporaryPaymentChange(
+            { token },
+            await buildDevTemporaryJourneyDeps(),
+          );
+          const nowIso = new Date().toISOString();
+          if (outcome.ok) {
+            return NextResponse.json({
+              ok: true,
+              stage: "temporary-change-verified",
+              intervention: toCustomerInterventionProjection(
+                outcome.record,
+                nowIso,
+              ),
+            });
+          }
+          if (outcome.reason === "not-found") {
+            return NextResponse.json(
+              { ok: false, stage: "not-found" },
+              { status: 404 },
+            );
+          }
+          const httpStatus =
+            outcome.reason === "confirmation-failed" ||
+            outcome.reason === "operation-evidence-failed"
+              ? 500
+              : outcome.reason === "refused" ||
+                  outcome.reason === "temporary-change-ambiguous" ||
+                  outcome.reason === "manual-recovery-required"
+                ? 502
+                : 409;
+          return NextResponse.json(
+            {
+              ok: false,
+              stage: outcome.reason,
+              ...(outcome.record !== undefined
+                ? {
+                    intervention: toCustomerInterventionProjection(
+                      outcome.record,
+                      nowIso,
+                    ),
+                  }
+                : {}),
+            },
+            { status: httpStatus },
+          );
+    };
+
+    // The existing protected permanent confirmation composition,
+    // byte-for-byte: preliminary gate, authoritative atomic claim, then
+    // the unchanged internal execution entry point.
+    const runPermanentConfirmation = async (): Promise<NextResponse> => {
     // Preliminary verification read: refuses early with a safe projection
     // when no usable record exists. The atomic claim below remains the
     // authoritative gate.
@@ -298,6 +378,13 @@ export async function POST(request: NextRequest) {
       },
       { status: httpStatus },
     );
+    };
+
+    // Exactly one protected execution path runs for the resolved kind.
+    return await dispatchFinalConfirmation(movementKind, {
+      temporary: runTemporaryConfirmation,
+      permanent: runPermanentConfirmation,
+    });
   } catch (error) {
     // Safe classification only — never bodies, tokens or identifiers
     // beyond what the log line names.

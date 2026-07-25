@@ -8,6 +8,8 @@ import {
   openIntervention,
 } from "@/lib/duelogic/intervention-service";
 import { getDevTransactionVerificationRepository } from "@/lib/duelogic/dev-transaction-verification-store";
+import { buildDevMovementProjectionDeps } from "@/lib/duelogic/dev-movement-journey";
+import { buildCustomerMovementProjection } from "@/lib/duelogic/movement-journey";
 import { ReviewForm } from "./review-form";
 
 /**
@@ -89,12 +91,20 @@ export default async function CustomerReviewPage({
     verification,
   );
 
+  // Server-derived movement availability and journey state: the policy
+  // engine and cadence resolver decide which movement choices exist —
+  // never the browser.
+  const movement = await buildCustomerMovementProjection(
+    record,
+    await buildDevMovementProjectionDeps(),
+  );
+
   return (
     <main className="mx-auto w-full max-w-xl px-6 py-10 font-sans text-sm">
       <h1 className="text-2xl font-semibold tracking-tight">
         Review your payment schedule
       </h1>
-      <ReviewForm token={rawToken} initialView={view} />
+      <ReviewForm token={rawToken} initialView={view} initialMovement={movement} />
     </main>
   );
 }

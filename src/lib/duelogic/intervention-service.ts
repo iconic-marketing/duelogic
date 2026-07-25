@@ -661,7 +661,16 @@ const CHECKABLE_STATUSES: ReadonlySet<InterventionStatus> = new Set([
  * and only then does the record reach preview-ready.
  */
 export async function evaluateSelectedDate(
-  input: { token: string; selectedDate: string },
+  input: {
+    token: string;
+    selectedDate: string;
+    /**
+     * Customer chose the permanent NEXT-CYCLE movement: dates inside the
+     * resolved next assigned cycle evaluate with next-cycle-and-future
+     * semantics (the engine still decides). Absent = existing behaviour.
+     */
+    nextCycleIntent?: boolean;
+  },
   fixture: InterventionDemoFixture,
   deps: InterventionRespondDeps,
 ): Promise<EvaluateSelectedDateOutcome> {
@@ -726,9 +735,13 @@ export async function evaluateSelectedDate(
     return refuseSelection("invalid-date");
   }
 
-  // The permitted window is the assigned current billing cycle; the one
-  // exception is the exact next-cycle date the policy engine itself offered.
-  let effectiveCycle: PermanentPolicyEvaluationRequest["effectiveCycle"];
+  // The permitted window is the assigned current billing cycle; the
+  // exceptions are the exact next-cycle date the policy engine itself
+  // offered, and — when the customer explicitly chose the next-cycle
+  // movement — any date inside the resolved next assigned cycle (checked
+  // below once the trusted cycle context is re-derived). The engine
+  // remains the deciding authority in every branch.
+  let effectiveCycle: PermanentPolicyEvaluationRequest["effectiveCycle"] | null;
   if (
     selectedDate >= record.currentCycleStartDate &&
     selectedDate <= record.currentCycleEndDate
@@ -739,6 +752,9 @@ export async function evaluateSelectedDate(
     selectedDate === record.offeredAlternativeDate
   ) {
     effectiveCycle = "next-cycle-and-future";
+  } else if (input.nextCycleIntent === true) {
+    // Deferred: validated against the resolved next-cycle bounds below.
+    effectiveCycle = null;
   } else {
     return refuseSelection("outside-window");
   }
@@ -778,6 +794,19 @@ export async function evaluateSelectedDate(
     cycle.currentCycleEndDate !== record.currentCycleEndDate
   ) {
     return { ok: false, reason: "not-evaluable", record };
+  }
+
+  // Deferred next-cycle window: the explicitly chosen next-cycle movement
+  // accepts only dates inside the resolved next assigned cycle.
+  if (effectiveCycle === null) {
+    if (
+      selectedDate >= cycle.nextCycleStartDate &&
+      selectedDate <= cycle.nextCycleEndDate
+    ) {
+      effectiveCycle = "next-cycle-and-future";
+    } else {
+      return refuseSelection("outside-window");
+    }
   }
 
   const request: PermanentPolicyEvaluationRequest = {
