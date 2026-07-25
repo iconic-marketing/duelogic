@@ -84,6 +84,19 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - A production implementation requires durable operation state before executing a replacement.
 - The hackathon replacement route is localhost-only proof code, not a production transaction coordinator.
 
+## Subscription replacement audit and recovery
+
+- Permanent subscription changes use a destructive cancel-then-create sequence; the replacement operation record is mandatory execution state, not optional logging.
+- A recovery snapshot — merchant-scoped IDs, the original start date, the exact reinstatement `POST /subscriptions` payload and the original first-three calculated-payment summary — must be written to the operation store and read back successfully before the original subscription is cancelled.
+- A failed recovery-record write or read-back aborts the operation before any mutation: no DELETE, no POST, original subscription untouched.
+- A successful replacement retains a permanent old-to-new subscription ID mapping: verified start date, plan, payer, source where exposed, and the first three verified payment dates and amounts.
+- Any failure after cancellation sets status `manual-recovery-required` with the exact failure stage (`cancel-verification-failed`, `replacement-create-failed`, `replacement-ambiguous`, `replacement-verification-failed`).
+- Ambiguous create or verification results are never retried automatically; a created-but-unverified replacement may be active, so no claim is made that the payer has no subscription.
+- Recovery records hold IDs, dates and integer cents only — never credentials, tokens, card, bank or customer identity data; the store write rejects records carrying forbidden keys.
+- The operation store (`src/lib/pinch/dev-replacement-operation-store.ts`, behind `SubscriptionReplacementOperationRepository`) is process-local, non-durable sandbox memory: it survives hot reloads only and must never be described as durable. Durable storage replaces the repository implementation, not the flow or route contracts.
+- The mutation sequence runs in `src/lib/pinch/replacement-operation-flow.ts` with injected storage, effects and clock; its deterministic validation (`src/lib/pinch/replacement-operation-validation.ts`) never calls Pinch and is re-asserted by `GET /api/pinch/dev/replacement-operations?operationId=...`, the localhost-only lookup that returns the safe projection only.
+- Automated recovery or reinstatement is outside the MVP: the snapshot enables a human or a future recovery command; nothing executes it automatically.
+
 ## Outcome events
 
 The proven payment lifecycle events are:

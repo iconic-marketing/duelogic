@@ -6,6 +6,15 @@ import {
   PinchConfigError,
   pinchRequest,
 } from "@/lib/pinch/client";
+import { getDevReplacementOperationRepository } from "@/lib/pinch/dev-replacement-operation-store";
+import type {
+  SubscriptionReinstatementCreateBody,
+  SubscriptionReplacementRecoverySnapshot,
+} from "@/lib/pinch/replacement-operation";
+import {
+  executeSubscriptionReplacement,
+  type ReplacementExecutionEffects,
+} from "@/lib/pinch/replacement-operation-flow";
 
 /**
  * Development-only endpoint that proves permanent recurring schedule
@@ -15,9 +24,14 @@ import {
  * The two mutations (DELETE then POST) are not atomic. Each is issued at
  * most once per request — never retried after any response or ambiguity —
  * and every failure after the original subscription is cancelled reports a
- * manual-recovery state instead of guessing. This is localhost-only proof
- * code, not a production transaction coordinator: production needs durable
- * operation state before executing a replacement.
+ * manual-recovery state instead of guessing. Before the DELETE is issued, an
+ * audit/recovery operation record (including the exact reinstatement payload)
+ * must be written and read back through the replacement-operation store; a
+ * failed write aborts with no mutation. The mutation sequence itself runs in
+ * src/lib/pinch/replacement-operation-flow.ts. This is localhost-only proof
+ * code, not a production transaction coordinator: the backing store is
+ * process-local sandbox memory, so production needs a durable
+ * SubscriptionReplacementOperationRepository before executing a replacement.
  *
  * Answers 404 unless the request arrives directly from localhost in
  * `next dev` — the shared guard in src/lib/dev/localhost-guard.ts.
@@ -453,22 +467,6 @@ function scheduleMatchesConfirmation(
   );
 }
 
-/**
- * The creation response may be a subscription object carrying `id` or a
- * bare ID string; in either case the ID must carry the sub_ prefix. No
- * other shape is probed — an unrecognisable success is treated as ambiguous
- * and never retried.
- */
-function extractNewSubscriptionId(result: unknown): string | null {
-  if (typeof result === "string") {
-    return prefixedId(result, "sub_");
-  }
-  if (isPlainObject(result)) {
-    return prefixedId(result.id, "sub_");
-  }
-  return null;
-}
-
 interface SafeLogContext {
   operationId: string;
   merchantId: string;
@@ -528,12 +526,6 @@ export async function POST(request: NextRequest) {
   };
 
   const subscriptionPath = `subscriptions/${encodeURIComponent(input.subscriptionId)}`;
-
-  // Set the moment the DELETE is issued. From then on, no code path may
-  // answer with a generic error: the caller must always learn that the
-  // operation is mid-flight and the original subscription may be gone.
-  let mutationStarted = false;
-  let newSubscriptionId: string | undefined;
 
   try {
     // -----------------------------------------------------------------
@@ -675,50 +667,193 @@ export async function POST(request: NextRequest) {
     }
 
     // -----------------------------------------------------------------
-    // Phase 2: cancel the original subscription.
+    // Phase 2: recovery-snapshot inputs — still read-only.
     // -----------------------------------------------------------------
-    // The one and only DELETE. Its outcome is deliberately not trusted:
-    // the verification GET below is the sole source of truth, and the
-    // DELETE is never repeated even if it throws or answers ambiguously.
-    mutationStarted = true;
-    try {
-      await pinchRequest<unknown>(subscriptionPath, {
-        method: "DELETE",
+    // The ORIGINAL schedule (original start date), so the recovery record
+    // preserves what a reinstated subscription would look like for human
+    // checking. Never computed locally: Pinch recalculates it.
+    const originalScheduleParams: Record<string, string | number> = {
+      startDate: subscription.startDate,
+    };
+    if (plan.requiresTotalAmount && subscription.totalAmountCents !== undefined) {
+      originalScheduleParams.totalAmount = subscription.totalAmountCents;
+    }
+    const originalCalculated = extractCalculatedPayments(
+      await pinchRequest<unknown>(calculatedPaymentsPath, {
         merchantId: input.merchantId,
-      });
-    } catch (error) {
-      console.error(
-        "Pinch dev subscription-replacement: DELETE reported an error; proceeding to cancellation verification without retrying.",
-        {
-          ...logContext,
-          errorClass: errorClassOf(error),
-          upstreamStatus: upstreamStatusOf(error),
-        },
+        searchParams: originalScheduleParams,
+      }),
+    );
+    if (originalCalculated === null) {
+      return apiFailure(
+        "original-schedule calculated-payments response could not be interpreted safely.",
+        logContext,
       );
+    }
+    const originalCalculatedPayments = orderCalculatedPayments(originalCalculated)
+      .slice(0, 3)
+      .map((payment) => ({
+        transactionDate: payment.transactionDate,
+        amountCents: payment.amountCents,
+      }));
+
+    // The exact payload POST /subscriptions would receive to reinstate the
+    // original subscription — the same field allowlist as the replacement
+    // body, with the original start date.
+    const reinstatementCreateBody: SubscriptionReinstatementCreateBody = {
+      planId: subscription.planId,
+      payerId: input.payerId,
+      sourceId: subscription.sourceId ?? input.sourceId,
+      startDate: subscription.startDate,
+    };
+    if (plan.requiresTotalAmount && subscription.totalAmountCents !== undefined) {
+      reinstatementCreateBody.totalAmount = subscription.totalAmountCents;
     }
 
-    let cancellationVerified = false;
-    try {
-      const cancelledRead = extractSubscriptionStatus(
+    const recoverySnapshot: SubscriptionReplacementRecoverySnapshot = {
+      merchantId: input.merchantId,
+      payerId: input.payerId,
+      sourceId: reinstatementCreateBody.sourceId,
+      planId: subscription.planId,
+      originalStartDate: subscription.startDate,
+      ...(plan.requiresTotalAmount && subscription.totalAmountCents !== undefined
+        ? { totalAmountCents: subscription.totalAmountCents }
+        : {}),
+      oldSubscriptionId: input.subscriptionId,
+      reinstatementCreateBody,
+      originalCalculatedPayments,
+    };
+
+    // The one and only POST /subscriptions body, built explicitly with only
+    // the four (or five) allowed fields. No merchantId, no old subscription
+    // ID, no operation metadata, no surcharge — the sandbox subscription
+    // has no surcharge selected, so omitting it preserves the proven setup.
+    const createBody: Record<string, unknown> = {
+      planId: subscription.planId,
+      payerId: input.payerId,
+      sourceId: input.sourceId,
+      startDate: input.proposedStartDate,
+    };
+    if (plan.requiresTotalAmount && subscription.totalAmountCents !== undefined) {
+      createBody.totalAmount = subscription.totalAmountCents;
+    }
+
+    const requiredTotalAmountCents =
+      plan.requiresTotalAmount && subscription.totalAmountCents !== undefined
+        ? subscription.totalAmountCents
+        : null;
+
+    // -----------------------------------------------------------------
+    // Phases 3-5: write-before-cancel, DELETE, POST and verification all
+    // run in the shared replacement-operation flow
+    // (src/lib/pinch/replacement-operation-flow.ts), which refuses to
+    // issue the DELETE until the operation record — with the recovery
+    // snapshot — has been written and read back, and never retries an
+    // effect. Each effect below issues its Pinch call at most once.
+    // -----------------------------------------------------------------
+    const effects: ReplacementExecutionEffects = {
+      cancelOriginal: async () => {
         await pinchRequest<unknown>(subscriptionPath, {
+          method: "DELETE",
+          merchantId: input.merchantId,
+        });
+      },
+      readOriginalStatus: async () =>
+        extractSubscriptionStatus(
+          await pinchRequest<unknown>(subscriptionPath, {
+            merchantId: input.merchantId,
+          }),
+        ),
+      createReplacement: async () =>
+        pinchRequest<unknown>("subscriptions", {
+          method: "POST",
+          body: createBody,
           merchantId: input.merchantId,
         }),
-      );
-      cancellationVerified =
-        cancelledRead !== null &&
-        cancelledRead.id === input.subscriptionId &&
-        cancelledRead.status.toLowerCase() === "cancelled";
-    } catch (error) {
+      verifyReplacement: async (newSubscriptionId) => {
+        const readBack = extractSubscriptionDetail(
+          await pinchRequest<unknown>(
+            `subscriptions/${encodeURIComponent(newSubscriptionId)}`,
+            { merchantId: input.merchantId },
+          ),
+        );
+        const recalculated = extractCalculatedPayments(
+          await pinchRequest<unknown>(calculatedPaymentsPath, {
+            merchantId: input.merchantId,
+            searchParams,
+          }),
+        );
+        if (readBack === null || recalculated === null) {
+          return null;
+        }
+        const ordered = orderCalculatedPayments(recalculated);
+        const verified =
+          readBack.id === newSubscriptionId &&
+          readBack.payerId === input.payerId &&
+          readBack.planId === subscription.planId &&
+          readBack.status.toLowerCase() === "active" &&
+          readBack.startDate === input.proposedStartDate &&
+          scheduleMatchesConfirmation(ordered, input.confirmedPayments);
+        if (!verified) {
+          return null;
+        }
+        const firstPayments = ordered.slice(0, input.confirmedPayments.length);
+        return {
+          oldSubscriptionId: input.subscriptionId,
+          newSubscriptionId,
+          verifiedStartDate: readBack.startDate,
+          planId: readBack.planId,
+          payerId: readBack.payerId,
+          ...(readBack.sourceId !== undefined
+            ? { sourceId: readBack.sourceId }
+            : {}),
+          paymentDates: firstPayments.map((payment) => payment.transactionDate),
+          paymentAmountsCents: firstPayments.map(
+            (payment) => payment.amountCents,
+          ),
+        };
+      },
+    };
+
+    const result = await executeSubscriptionReplacement(
+      {
+        operationId: input.operationId,
+        merchantId: input.merchantId,
+        payerId: input.payerId,
+        planId: subscription.planId,
+        sourceId: input.sourceId,
+        oldSubscriptionId: input.subscriptionId,
+        previousStartDate: subscription.startDate,
+        requestedStartDate: input.proposedStartDate,
+        previousTotalAmountCents: requiredTotalAmountCents,
+        requestedTotalAmountCents: requiredTotalAmountCents,
+        recoverySnapshot,
+      },
+      getDevReplacementOperationRepository(),
+      effects,
+      () => new Date().toISOString(),
+      (message, context) => console.error(message, context),
+    );
+
+    if (result.outcome === "recovery-record-failed") {
+      // Nothing was mutated: the flow never issues the DELETE unless the
+      // recovery record was written and read back successfully.
       console.error(
-        "Pinch dev subscription-replacement: cancellation verification read failed.",
+        'Pinch dev subscription-replacement refused at stage "recovery-record": the operation record could not be written and read back, so no mutation was issued.',
+        logContext,
+      );
+      return NextResponse.json(
         {
-          ...logContext,
-          errorClass: errorClassOf(error),
-          upstreamStatus: upstreamStatusOf(error),
+          ok: false,
+          stage: "recovery-record",
+          operationId: input.operationId,
+          oldSubscriptionId: input.subscriptionId,
+          originalSubscriptionUntouched: true,
         },
+        { status: 500 },
       );
     }
-    if (!cancellationVerified) {
+    if (result.outcome === "cancel-verification-failed") {
       console.error(
         'Pinch dev subscription-replacement failed at stage "cancel-verification".',
         { ...logContext, requiresManualReview: true },
@@ -734,43 +869,7 @@ export async function POST(request: NextRequest) {
         { status: 502 },
       );
     }
-
-    // -----------------------------------------------------------------
-    // Phase 3: create the replacement.
-    // -----------------------------------------------------------------
-    // The one and only POST /subscriptions, built explicitly with only the
-    // four (or five) allowed fields. No merchantId, no old subscription
-    // ID, no operation metadata, no surcharge — the sandbox subscription
-    // has no surcharge selected, so omitting it preserves the proven
-    // setup. Never retried: any failure or ambiguity after this point is a
-    // manual-recovery state because the original is already cancelled.
-    const createBody: Record<string, unknown> = {
-      planId: subscription.planId,
-      payerId: input.payerId,
-      sourceId: input.sourceId,
-      startDate: input.proposedStartDate,
-    };
-    if (plan.requiresTotalAmount && subscription.totalAmountCents !== undefined) {
-      createBody.totalAmount = subscription.totalAmountCents;
-    }
-
-    let created: unknown;
-    try {
-      created = await pinchRequest<unknown>("subscriptions", {
-        method: "POST",
-        body: createBody,
-        merchantId: input.merchantId,
-      });
-    } catch (error) {
-      console.error(
-        'Pinch dev subscription-replacement failed at stage "replacement-create": original subscription is cancelled and the replacement was not created.',
-        {
-          ...logContext,
-          errorClass: errorClassOf(error),
-          upstreamStatus: upstreamStatusOf(error),
-          requiresManualRecovery: true,
-        },
-      );
+    if (result.outcome === "replacement-create-failed") {
       return NextResponse.json(
         {
           ok: false,
@@ -783,15 +882,7 @@ export async function POST(request: NextRequest) {
         { status: 502 },
       );
     }
-
-    const extractedId = extractNewSubscriptionId(created);
-    if (extractedId === null) {
-      // Upstream reported success, so a replacement may exist; repeating
-      // the POST could create a duplicate and is forbidden.
-      console.error(
-        'Pinch dev subscription-replacement failed at stage "replacement-ambiguous": creation reported success but no subscription ID could be extracted.',
-        { ...logContext, requiresManualRecovery: true },
-      );
+    if (result.outcome === "replacement-ambiguous") {
       return NextResponse.json(
         {
           ok: false,
@@ -804,54 +895,9 @@ export async function POST(request: NextRequest) {
         { status: 502 },
       );
     }
-    newSubscriptionId = extractedId;
-    logContext.newSubscriptionId = newSubscriptionId;
-
-    // -----------------------------------------------------------------
-    // Phase 4: verify the replacement. Read-only; a failure here performs
-    // no further mutation and reports the created-but-unverified state.
-    // -----------------------------------------------------------------
-    let verified = false;
-    let newStatus = "";
-    try {
-      const readBack = extractSubscriptionDetail(
-        await pinchRequest<unknown>(
-          `subscriptions/${encodeURIComponent(newSubscriptionId)}`,
-          { merchantId: input.merchantId },
-        ),
-      );
-      const recalculated = extractCalculatedPayments(
-        await pinchRequest<unknown>(calculatedPaymentsPath, {
-          merchantId: input.merchantId,
-          searchParams,
-        }),
-      );
-      verified =
-        readBack !== null &&
-        readBack.id === newSubscriptionId &&
-        readBack.payerId === input.payerId &&
-        readBack.planId === subscription.planId &&
-        readBack.status.toLowerCase() === "active" &&
-        readBack.startDate === input.proposedStartDate &&
-        recalculated !== null &&
-        scheduleMatchesConfirmation(
-          orderCalculatedPayments(recalculated),
-          input.confirmedPayments,
-        );
-      if (readBack !== null) {
-        newStatus = readBack.status.toLowerCase();
-      }
-    } catch (error) {
-      console.error(
-        "Pinch dev subscription-replacement: replacement verification read failed.",
-        {
-          ...logContext,
-          errorClass: errorClassOf(error),
-          upstreamStatus: upstreamStatusOf(error),
-        },
-      );
-    }
-    if (!verified) {
+    if (result.outcome === "replacement-verification-failed") {
+      logContext.newSubscriptionId =
+        result.record.newSubscriptionId ?? undefined;
       console.error(
         'Pinch dev subscription-replacement failed at stage "replacement-verification".',
         { ...logContext, requiresManualReview: true },
@@ -862,12 +908,16 @@ export async function POST(request: NextRequest) {
           stage: "replacement-verification",
           operationId: input.operationId,
           oldSubscriptionId: input.subscriptionId,
-          newSubscriptionId,
+          newSubscriptionId: result.record.newSubscriptionId,
           requiresManualReview: true,
         },
         { status: 502 },
       );
     }
+
+    // result.outcome === "replacement-verified": the completed record now
+    // holds the permanent old-to-new subscription mapping.
+    logContext.newSubscriptionId = result.record.newSubscriptionId ?? undefined;
 
     return NextResponse.json({
       ok: true,
@@ -881,42 +931,18 @@ export async function POST(request: NextRequest) {
         status: "cancelled",
       },
       newSubscription: {
-        id: newSubscriptionId,
+        id: result.record.newSubscriptionId,
         planId: subscription.planId,
         startDate: input.proposedStartDate,
-        status: newStatus,
+        status: "active",
       },
       confirmedPayments: input.confirmedPayments,
     });
   } catch (error) {
-    // Phases 2-4 contain their own error handling and never rethrow, so
-    // this catch normally fires only during read-only preflight. The
-    // mutationStarted guard is a second net: if an unexpected bug escapes
-    // after the DELETE was issued, the caller must still learn that the
-    // operation is mid-flight rather than receive a generic error.
-    if (mutationStarted) {
-      console.error(
-        'Pinch dev subscription-replacement failed unexpectedly after mutation began; stage "replacement-create".',
-        {
-          ...logContext,
-          errorClass: errorClassOf(error),
-          upstreamStatus: upstreamStatusOf(error),
-          requiresManualRecovery: true,
-        },
-      );
-      return NextResponse.json(
-        {
-          ok: false,
-          stage: "replacement-create",
-          operationId: input.operationId,
-          oldSubscriptionId: input.subscriptionId,
-          proposedStartDate: input.proposedStartDate,
-          requiresManualRecovery: true,
-        },
-        { status: 502 },
-      );
-    }
-
+    // The replacement-operation flow contains its own error handling and
+    // never rethrows once mutation has begun (its safety net converts an
+    // unexpected escape into a manual-recovery outcome), so this catch
+    // fires only during read-only preflight.
     const stage =
       error instanceof PinchAuthError || error instanceof PinchConfigError
         ? "auth"
