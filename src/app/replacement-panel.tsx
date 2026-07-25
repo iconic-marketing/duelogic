@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { REPLACEMENT_DEMO_FIXTURE } from "@/lib/dev/replacement-demo-fixture";
 import { formatAud, visibleDescription } from "@/lib/duelogic/display";
 import { ReplacementAudit } from "./replacement-audit";
@@ -8,22 +8,29 @@ import { ReplacementAudit } from "./replacement-audit";
 /**
  * Live permanent subscription replacement over the existing localhost-only
  * dev routes. The flow is strictly: fresh Pinch preview → gate checks →
- * explicit human confirmation of the exact dates and amounts → exactly one
- * call to the protected replacement route. The demo identifiers come from a
- * fixed fixture and are never editable here; confirmed payments are always
- * the live preview's own dates and amounts, never generated locally; and an
- * execution attempt latches the controls off permanently — no retry is ever
- * issued, whatever the response.
+ * server-recorded customer confirmation (a separate customer-facing page
+ * accepts or declines the exact dates and amounts) → merchant execution
+ * acknowledgement → exactly one call to the protected replacement route.
+ * The merchant checkbox is an operator safeguard only — customer consent is
+ * the server-held confirmation, which the replacement route independently
+ * re-verifies and consumes. The demo identifiers come from a fixed fixture
+ * and are never editable here; confirmed payments are always the live
+ * preview's own dates and amounts, never generated locally; and an
+ * execution attempt latches the controls off permanently — no retry is
+ * ever issued, whatever the response.
  */
 
 const FIXTURE = REPLACEMENT_DEMO_FIXTURE;
 
 /**
  * The existing backend confirmation contract. Submitted only after the
- * visible acknowledgement checkbox is selected — the phrase itself is the
- * route's contract, not a UI-invented control.
+ * server reports an accepted customer confirmation AND the merchant selects
+ * the visible acknowledgement — the phrase itself is the route's contract,
+ * not a UI-invented control.
  */
 const BACKEND_CONFIRMATION_PHRASE = "REPLACE FUTURE SCHEDULE";
+
+const CONFIRMATION_POLL_INTERVAL_MS = 2000;
 
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -54,6 +61,18 @@ interface LoadedPreview {
 interface PreviewGate {
   ok: boolean;
   label: string;
+}
+
+/** The merchant-safe confirmation view returned by the dev routes. */
+interface MerchantConfirmationView {
+  confirmationId: string;
+  status: string;
+  proposedStartDate: string;
+  proposedPayments: Array<{ paymentDate: string; amountInCents: number }>;
+  expiresAt: string;
+  acceptedAt: string | null;
+  declinedAt: string | null;
+  consumedAt: string | null;
 }
 
 type ExecutionResult =
@@ -103,6 +122,55 @@ function parsePayments(value: unknown): PreviewPayment[] | null {
     payments.push(payment);
   }
   return payments;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * Parses a merchant confirmation view from either the flat creation
+ * response or the lookup's nested projection. Lifecycle timestamps are
+ * optional in the creation response and default to null.
+ */
+function parseConfirmationView(
+  value: unknown,
+): MerchantConfirmationView | null {
+  if (
+    !isRecord(value) ||
+    typeof value.confirmationId !== "string" ||
+    typeof value.status !== "string" ||
+    typeof value.proposedStartDate !== "string" ||
+    typeof value.expiresAt !== "string" ||
+    !Array.isArray(value.proposedPayments)
+  ) {
+    return null;
+  }
+  const proposedPayments: Array<{ paymentDate: string; amountInCents: number }> =
+    [];
+  for (const entry of value.proposedPayments) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.paymentDate !== "string" ||
+      !isPositiveIntegerCents(entry.amountInCents)
+    ) {
+      return null;
+    }
+    proposedPayments.push({
+      paymentDate: entry.paymentDate,
+      amountInCents: entry.amountInCents,
+    });
+  }
+  return {
+    confirmationId: value.confirmationId,
+    status: value.status,
+    proposedStartDate: value.proposedStartDate,
+    proposedPayments,
+    expiresAt: value.expiresAt,
+    acceptedAt: stringOrNull(value.acceptedAt),
+    declinedAt: stringOrNull(value.declinedAt),
+    consumedAt: stringOrNull(value.consumedAt),
+  };
 }
 
 /**
@@ -159,10 +227,10 @@ async function fetchSchedulePreview(
 }
 
 /**
- * The conditions that must all hold before confirmation is offered. The
- * live preview is authoritative; the expected-dates check exists so a
- * drifted sandbox produces an honest warning instead of a surprise
- * mutation.
+ * The conditions that must all hold before a customer confirmation can be
+ * requested. The live preview is authoritative; the expected-dates check
+ * exists so a drifted sandbox produces an honest warning instead of a
+ * surprise mutation.
  */
 function computeGates(preview: SchedulePreview): PreviewGate[] {
   const dates = preview.payments.map((payment) => payment.transactionDate);
@@ -260,6 +328,62 @@ function interpretReplacementResponse(body: unknown): ExecutionResult {
         detail: `Preflight refused: the subscription is ${status}. No mutation was issued — a repeat call never creates another replacement.`,
       };
     }
+    case "confirmation-not-found":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "No customer confirmation record was found for this execution, so nothing was mutated. Create a new confirmation request.",
+      };
+    case "confirmation-pending":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "The customer has not accepted the confirmation yet, so nothing was mutated. Wait for the customer's acceptance.",
+      };
+    case "confirmation-declined":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "The customer declined this schedule change, so nothing was mutated. A new confirmation request is required for any further attempt.",
+      };
+    case "confirmation-expired":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "The customer confirmation expired before execution, so nothing was mutated. Create a new confirmation request.",
+      };
+    case "confirmation-consumed":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "This customer confirmation was already used by an earlier execution, so nothing was mutated now. It cannot be reused; a fresh confirmation is required.",
+      };
+    case "confirmation-mismatch":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "The customer confirmation does not match this exact replacement (IDs, plan, start date or payments), so nothing was mutated. Create a new confirmation from a fresh preview.",
+      };
+    case "confirmation-store":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "The confirmation store could not be read, so nothing was mutated. The original subscription is untouched.",
+      };
+    case "confirmation-consumption":
+      return {
+        kind: "refused",
+        stage,
+        detail:
+          "The customer confirmation could not be verifiably consumed, so the operation aborted with nothing persisted and nothing mutated. The original subscription is untouched.",
+      };
     case "confirmation-stale":
       return {
         kind: "refused",
@@ -329,6 +453,20 @@ function interpretReplacementResponse(body: unknown): ExecutionResult {
   }
 }
 
+const expiryFormatter = new Intl.DateTimeFormat("en-AU", {
+  dateStyle: "medium",
+  timeStyle: "short",
+  timeZone: "Australia/Sydney",
+});
+
+function formatExpiry(expiresAt: string): string {
+  const parsed = Date.parse(expiresAt);
+  if (Number.isNaN(parsed)) {
+    return expiresAt;
+  }
+  return `${expiryFormatter.format(new Date(parsed))} (Sydney time)`;
+}
+
 function PaymentScheduleTable({
   payments,
   caption,
@@ -369,6 +507,16 @@ export function ReplacementPanel() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [preview, setPreview] = useState<LoadedPreview | null>(null);
+
+  const [confirmation, setConfirmation] =
+    useState<MerchantConfirmationView | null>(null);
+  const [confirmationUrl, setConfirmationUrl] = useState<string | null>(null);
+  const [confirmationBusy, setConfirmationBusy] = useState(false);
+  const [confirmationError, setConfirmationError] = useState<string | null>(
+    null,
+  );
+  const [linkCopied, setLinkCopied] = useState(false);
+
   const [acknowledged, setAcknowledged] = useState(false);
   /** Latched true at the first execution attempt and never reset. */
   const [executionStarted, setExecutionStarted] = useState(false);
@@ -377,7 +525,12 @@ export function ReplacementPanel() {
   const [result, setResult] = useState<ExecutionResult | null>(null);
 
   const gates = preview === null ? [] : computeGates(preview.proposed);
-  const executionAllowed = gates.length > 0 && gates.every((gate) => gate.ok);
+  const previewValid = gates.length > 0 && gates.every((gate) => gate.ok);
+  const confirmationStatus = confirmation?.status ?? null;
+  const confirmationId = confirmation?.confirmationId ?? null;
+  const customerAccepted = confirmationStatus === "accepted";
+  const confirmationActive =
+    confirmationStatus === "pending" || confirmationStatus === "accepted";
 
   const loadPreview = async () => {
     if (previewLoading || executionStarted) {
@@ -414,16 +567,160 @@ export function ReplacementPanel() {
     }
   };
 
+  const createConfirmation = async () => {
+    // No accidental duplicates: creation is blocked while a pending or
+    // accepted confirmation exists, and permanently after execution begins.
+    if (
+      confirmationBusy ||
+      executionStarted ||
+      preview === null ||
+      preview.currentPayments === null ||
+      !previewValid ||
+      confirmationActive
+    ) {
+      return;
+    }
+    setConfirmationBusy(true);
+    setConfirmationError(null);
+    setLinkCopied(false);
+    try {
+      const response = await fetch("/api/duelogic/dev/confirmations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // The exact live preview values — never locally derived dates.
+        body: JSON.stringify({
+          merchantId: FIXTURE.merchantId,
+          payerId: FIXTURE.payerId,
+          sourceId: FIXTURE.sourceId,
+          subscriptionId: FIXTURE.subscriptionId,
+          planId: preview.proposed.planId,
+          currentStartDate: preview.proposed.currentStartDate,
+          proposedStartDate: preview.proposed.proposedStartDate,
+          currentPayments: preview.currentPayments.map((payment) => ({
+            paymentDate: payment.transactionDate,
+            amountInCents: payment.amountCents,
+          })),
+          proposedPayments: preview.proposed.payments.map((payment) => ({
+            paymentDate: payment.transactionDate,
+            amountInCents: payment.amountCents,
+          })),
+          currency: "AUD",
+        }),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      const view =
+        response.ok && isRecord(body) && body.ok === true
+          ? parseConfirmationView(body)
+          : null;
+      const url =
+        isRecord(body) && typeof body.customerConfirmationUrl === "string"
+          ? body.customerConfirmationUrl
+          : null;
+      if (view === null || url === null) {
+        setConfirmationError(
+          "The confirmation request could not be created. Check the dev server log.",
+        );
+        return;
+      }
+      setConfirmation(view);
+      setConfirmationUrl(url);
+    } catch {
+      setConfirmationError(
+        "The confirmation request failed. Is the dev server running on localhost?",
+      );
+    } finally {
+      setConfirmationBusy(false);
+    }
+  };
+
+  const refreshConfirmation = async (id: string) => {
+    try {
+      const query = new URLSearchParams({ confirmationId: id });
+      const response = await fetch(
+        `/api/duelogic/dev/confirmations?${query.toString()}`,
+        { cache: "no-store" },
+      );
+      const body: unknown = await response.json().catch(() => null);
+      const view =
+        response.ok && isRecord(body) && body.ok === true
+          ? parseConfirmationView(body.confirmation)
+          : null;
+      if (view === null) {
+        setConfirmationError(
+          "The confirmation status could not be read just now.",
+        );
+        return;
+      }
+      setConfirmationError(null);
+      setConfirmation(view);
+    } catch {
+      setConfirmationError(
+        "The confirmation status could not be read just now.",
+      );
+    }
+  };
+
+  // Poll the server-held confirmation status every two seconds while it is
+  // pending. Stops on any terminal or accepted status, once execution has
+  // begun, and on unmount. Reads the confirmation store only — never Pinch.
+  useEffect(() => {
+    if (
+      confirmationId === null ||
+      confirmationStatus !== "pending" ||
+      executionStarted
+    ) {
+      return;
+    }
+    let disposed = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (disposed || inFlight || document.hidden) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const query = new URLSearchParams({ confirmationId });
+        const response = await fetch(
+          `/api/duelogic/dev/confirmations?${query.toString()}`,
+          { cache: "no-store" },
+        );
+        const body: unknown = await response.json().catch(() => null);
+        const view =
+          response.ok && isRecord(body) && body.ok === true
+            ? parseConfirmationView(body.confirmation)
+            : null;
+        if (!disposed && view !== null) {
+          setConfirmation(view);
+        }
+      } catch {
+        // Transient poll failures are silent; the manual refresh button and
+        // the next tick both remain available.
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => {
+      void poll();
+    }, CONFIRMATION_POLL_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [confirmationId, confirmationStatus, executionStarted]);
+
   const executeReplacement = async () => {
     // The disabled button already blocks this; the guard covers programmatic
     // re-entry. Once executionStarted latches, no second submission can ever
-    // be issued from this page load.
+    // be issued from this page load. Server-side, the route re-verifies and
+    // consumes the confirmation independently of this client state.
     if (
       executionStarted ||
       executing ||
       !acknowledged ||
+      !customerAccepted ||
+      confirmationId === null ||
       preview === null ||
-      !executionAllowed
+      !previewValid
     ) {
       return;
     }
@@ -442,6 +739,7 @@ export function ReplacementPanel() {
           subscriptionId: FIXTURE.subscriptionId,
           proposedStartDate: FIXTURE.proposedStartDate,
           operationId: newOperationId,
+          confirmationId,
           confirmation: BACKEND_CONFIRMATION_PHRASE,
           // Always the live preview's own dates and amounts — never
           // locally generated values.
@@ -461,6 +759,9 @@ export function ReplacementPanel() {
       });
     } finally {
       setExecuting(false);
+      if (confirmationId !== null) {
+        void refreshConfirmation(confirmationId);
+      }
     }
   };
 
@@ -478,13 +779,15 @@ export function ReplacementPanel() {
       </div>
       <p className="mb-1 text-zinc-600 dark:text-zinc-400">
         A permanent correction replaces the subscription: Pinch previews the
-        new schedule, the customer confirms the exact dates and amounts, and
-        only then is the protected replacement route called — exactly once.
+        new schedule, the customer accepts the exact dates and amounts
+        through their own confirmation link, and only then is the protected
+        replacement route called — exactly once.
       </p>
       <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-500">
         A customer free-text request alone is never authority to change a
-        subscription. Everything below operates on a real Pinch sandbox
-        subscription; nothing is simulated.
+        subscription, and a merchant checkbox is not customer consent — the
+        server-held confirmation record is. Everything below operates on a
+        real Pinch sandbox subscription; nothing is simulated.
       </p>
 
       <dl className="mb-4 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
@@ -551,8 +854,9 @@ export function ReplacementPanel() {
                 />
               ) : (
                 <p className="text-xs text-zinc-500 dark:text-zinc-500">
-                  The current schedule could not be read; the proposed
-                  schedule below is unaffected.
+                  The current schedule could not be read; a customer
+                  confirmation cannot be created without it. Reload the
+                  preview.
                 </p>
               )}
               <PaymentScheduleTable
@@ -580,19 +884,145 @@ export function ReplacementPanel() {
                 </li>
               ))}
             </ul>
-            {!executionAllowed ? (
+            {!previewValid ? (
               <p role="alert" className="mt-2 text-red-700 dark:text-red-400">
                 The live preview does not satisfy every check above, so
-                confirmation and execution stay disabled. The live Pinch
-                response is authoritative — the expected values are only
-                human-validation aids.
+                customer confirmation and execution stay disabled. The live
+                Pinch response is authoritative — the expected values are
+                only human-validation aids.
               </p>
             ) : null}
           </div>
 
-          {executionAllowed ? (
+          {previewValid ? (
             <div className="rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
-              <h3 className="font-medium">Explicit customer confirmation</h3>
+              <h3 className="font-medium">Customer confirmation</h3>
+              <p className="mt-1 text-zinc-600 dark:text-zinc-400">
+                The customer must accept the exact proposed dates and amounts
+                through their own confirmation page before execution unlocks.
+                The link is single use and expires 30 minutes after creation.
+              </p>
+              {confirmation === null ? (
+                <button
+                  type="button"
+                  className="mt-3 rounded bg-zinc-900 px-4 py-1.5 font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+                  onClick={() => {
+                    void createConfirmation();
+                  }}
+                  disabled={
+                    confirmationBusy ||
+                    executionStarted ||
+                    preview?.currentPayments === null
+                  }
+                >
+                  {confirmationBusy
+                    ? "Creating confirmation link…"
+                    : "Create customer confirmation link"}
+                </button>
+              ) : (
+                <div className="mt-3 flex flex-col gap-2">
+                  <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
+                    <dt className="font-medium">Status</dt>
+                    <dd>
+                      <span
+                        className={
+                          customerAccepted
+                            ? "font-medium text-green-800 dark:text-green-400"
+                            : confirmationStatus === "pending"
+                              ? "text-amber-700 dark:text-amber-400"
+                              : "font-medium text-red-700 dark:text-red-400"
+                        }
+                      >
+                        {confirmationStatus}
+                      </span>{" "}
+                      <span className="text-xs text-zinc-500">
+                        (server-held; refreshed every 2 seconds while pending)
+                      </span>
+                    </dd>
+                    <dt className="font-medium">Expires</dt>
+                    <dd>{formatExpiry(confirmation.expiresAt)}</dd>
+                    {confirmation.acceptedAt !== null ? (
+                      <>
+                        <dt className="font-medium">Accepted at</dt>
+                        <dd className="font-mono text-xs">
+                          {confirmation.acceptedAt}
+                        </dd>
+                      </>
+                    ) : null}
+                  </dl>
+                  {confirmationUrl !== null ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <code className="max-w-full overflow-x-auto rounded bg-zinc-100 px-2 py-1 text-xs dark:bg-zinc-900">
+                        {confirmationUrl}
+                      </code>
+                      <button
+                        type="button"
+                        className="rounded border border-zinc-300 px-2.5 py-0.5 text-xs font-medium dark:border-zinc-700"
+                        onClick={() => {
+                          void navigator.clipboard
+                            .writeText(confirmationUrl)
+                            .then(() => setLinkCopied(true))
+                            .catch(() => setLinkCopied(false));
+                        }}
+                      >
+                        {linkCopied ? "Copied" : "Copy link"}
+                      </button>
+                      <a
+                        href={confirmationUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded border border-zinc-300 px-2.5 py-0.5 text-xs font-medium dark:border-zinc-700"
+                      >
+                        Open customer confirmation
+                      </a>
+                      <button
+                        type="button"
+                        className="rounded border border-zinc-300 px-2.5 py-0.5 text-xs font-medium dark:border-zinc-700"
+                        onClick={() => {
+                          if (confirmationId !== null) {
+                            void refreshConfirmation(confirmationId);
+                          }
+                        }}
+                      >
+                        Refresh confirmation status
+                      </button>
+                    </div>
+                  ) : null}
+                  {confirmationStatus === "declined" ||
+                  confirmationStatus === "expired" ? (
+                    <div>
+                      <p role="alert" className="text-red-700 dark:text-red-400">
+                        {confirmationStatus === "declined"
+                          ? "The customer declined this schedule change. Execution stays disabled; no replacement can be made using this confirmation."
+                          : "This confirmation expired before acceptance. Execution stays disabled."}
+                      </p>
+                      {!executionStarted ? (
+                        <button
+                          type="button"
+                          className="mt-2 rounded bg-zinc-900 px-4 py-1.5 font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+                          onClick={() => {
+                            void createConfirmation();
+                          }}
+                          disabled={confirmationBusy}
+                        >
+                          Create new confirmation link
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              )}
+              {confirmationError !== null ? (
+                <p role="alert" className="mt-2 text-red-700 dark:text-red-400">
+                  {confirmationError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {previewValid ? (
+            <div className="rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+              <h3 className="font-medium">Execution</h3>
               <p className="mt-2">
                 Replacing subscription{" "}
                 <span className="font-mono text-xs">
@@ -615,8 +1045,38 @@ export function ReplacementPanel() {
                 This permanent change cancels the original subscription and
                 creates a replacement. The two steps are not atomic: a failure
                 after cancellation requires manual recovery. The request is
-                sent exactly once and is never retried.
+                sent exactly once and is never retried, and the customer
+                confirmation is consumed by the attempt.
               </p>
+              <ul className="mt-3 flex flex-col gap-1">
+                <li className="flex gap-2">
+                  <span
+                    className={
+                      customerAccepted
+                        ? "text-green-800 dark:text-green-400"
+                        : "font-medium text-red-700 dark:text-red-400"
+                    }
+                  >
+                    {customerAccepted ? "✓" : "✗"}
+                  </span>
+                  <span>
+                    Customer confirmation received (server-held status:{" "}
+                    {confirmationStatus ?? "none"})
+                  </span>
+                </li>
+                <li className="flex gap-2">
+                  <span
+                    className={
+                      acknowledged
+                        ? "text-green-800 dark:text-green-400"
+                        : "font-medium text-red-700 dark:text-red-400"
+                    }
+                  >
+                    {acknowledged ? "✓" : "✗"}
+                  </span>
+                  <span>Merchant execution acknowledgement</span>
+                </li>
+              </ul>
               <label className="mt-3 flex items-start gap-2">
                 <input
                   type="checkbox"
@@ -626,14 +1086,16 @@ export function ReplacementPanel() {
                   disabled={executionStarted}
                 />
                 <span>
-                  I confirm these exact future payment dates and understand
-                  that the existing subscription will be replaced.
+                  As the operator, I acknowledge executing this permanent
+                  replacement now. (This is an operator safeguard — customer
+                  consent is the server-held confirmation above.)
                 </span>
               </label>
               <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-500">
-                Rehearsal note: everything up to this point is read-only.
-                Pressing the button below executes the real cancel-and-create
-                sequence in the Pinch sandbox.
+                Rehearsal note: everything up to this point is safe — the
+                preview is read-only and the confirmation link mutates
+                nothing in Pinch. Pressing the button below executes the real
+                cancel-and-create sequence in the Pinch sandbox.
               </p>
               <button
                 type="button"
@@ -641,7 +1103,12 @@ export function ReplacementPanel() {
                 onClick={() => {
                   void executeReplacement();
                 }}
-                disabled={!acknowledged || executionStarted || executing}
+                disabled={
+                  !acknowledged ||
+                  !customerAccepted ||
+                  executionStarted ||
+                  executing
+                }
               >
                 {executing
                   ? "Executing replacement…"
@@ -656,8 +1123,9 @@ export function ReplacementPanel() {
 
       {executing ? (
         <p className="mt-4">
-          Executing the permanent replacement — cancel, then create, then
-          verify. This is sent once and never retried. Leave this page open.
+          Executing the permanent replacement — verify consent, consume the
+          confirmation, record recovery, cancel, create, verify. This is sent
+          once and never retried. Leave this page open.
         </p>
       ) : null}
 
@@ -695,6 +1163,14 @@ export function ReplacementPanel() {
                   <>
                     <dt className="font-medium">Source retained</dt>
                     <dd className="font-mono text-xs">{result.sourceId}</dd>
+                  </>
+                ) : null}
+                {confirmationId !== null ? (
+                  <>
+                    <dt className="font-medium">Customer confirmation</dt>
+                    <dd className="font-mono text-xs">
+                      {confirmationId} (consumed)
+                    </dd>
                   </>
                 ) : null}
                 <dt className="font-medium">Verified payments</dt>

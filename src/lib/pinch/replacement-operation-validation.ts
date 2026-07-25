@@ -85,6 +85,7 @@ function demoSnapshot(): SubscriptionReplacementRecoverySnapshot {
 function demoRequest(): ReplacementExecutionRequest {
   return {
     operationId: "op-demo-01",
+    confirmationId: "conf-demo-01",
     merchantId: "mch_demo",
     payerId: "pyr_demo",
     planId: "pln_demo",
@@ -154,6 +155,7 @@ function instrumentedRepository(
 interface EffectsInstrumentation {
   effects: ReplacementExecutionEffects;
   calls: {
+    consumeCustomerConfirmation: number;
     cancelOriginal: number;
     readOriginalStatus: number;
     createReplacement: number;
@@ -164,6 +166,7 @@ interface EffectsInstrumentation {
 function instrumentedEffects(
   events: string[],
   options: {
+    consumeReturnsFalse?: boolean;
     cancelThrows?: boolean;
     originalStatusAfterCancel?: string;
     originalStatusReadThrows?: boolean;
@@ -174,12 +177,21 @@ function instrumentedEffects(
   } = {},
 ): EffectsInstrumentation {
   const calls = {
+    consumeCustomerConfirmation: 0,
     cancelOriginal: 0,
     readOriginalStatus: 0,
     createReplacement: 0,
     verifyReplacement: 0,
   };
   const effects: ReplacementExecutionEffects = {
+    // Deliberately not an "effects."-prefixed event: consumption touches
+    // only the confirmation store, so the first-Pinch-effect assertions
+    // below stay meaningful.
+    async consumeCustomerConfirmation() {
+      calls.consumeCustomerConfirmation += 1;
+      events.push("confirmation.consume");
+      return options.consumeReturnsFalse !== true;
+    },
     async cancelOriginal() {
       calls.cancelOriginal += 1;
       events.push("effects.cancelOriginal");
@@ -278,8 +290,17 @@ export async function validateReplacementOperationRecovery(): Promise<Replacemen
         readsBeforeAnyEffect >= 2,
       "s01: the recovery record must be written and read back (twice) before the cancellation effect runs",
     );
+    const consumeIndex = events.indexOf("confirmation.consume");
+    const firstWriteIndex = events.indexOf("repository.write");
     check(
-      calls.cancelOriginal === 1 &&
+      consumeIndex !== -1 &&
+        firstWriteIndex !== -1 &&
+        consumeIndex < firstWriteIndex,
+      "s01: the customer confirmation must be consumed before the recovery record is written",
+    );
+    check(
+      calls.consumeCustomerConfirmation === 1 &&
+        calls.cancelOriginal === 1 &&
         calls.readOriginalStatus === 1 &&
         calls.createReplacement === 1 &&
         calls.verifyReplacement === 1,
@@ -289,6 +310,7 @@ export async function validateReplacementOperationRecovery(): Promise<Replacemen
       check(
         outcome.record.status === "replacement-verified" &&
           outcome.record.currentStage === "replacement-verified" &&
+          outcome.record.confirmationId === "conf-demo-01" &&
           outcome.record.oldSubscriptionId === OLD_SUBSCRIPTION_ID &&
           outcome.record.newSubscriptionId === NEW_SUBSCRIPTION_ID &&
           outcome.record.verifiedReplacement !== null &&
@@ -604,6 +626,7 @@ export async function validateReplacementOperationRecovery(): Promise<Replacemen
       const projection = toSafeReplacementOperationProjection(stored);
       const expectedKeys = [
         "operationId",
+        "confirmationId",
         "status",
         "currentStage",
         "oldSubscriptionId",
@@ -669,6 +692,7 @@ export async function validateReplacementOperationRecovery(): Promise<Replacemen
 function baseRecordForStoreChecks(): SubscriptionReplacementOperationRecord {
   return {
     operationId: "op-demo-store-01",
+    confirmationId: "conf-demo-01",
     merchantId: "mch_demo",
     payerId: "pyr_demo",
     planId: "pln_demo",

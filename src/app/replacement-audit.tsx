@@ -26,6 +26,8 @@ interface VerifiedMapping {
 
 interface AuditProjection {
   operationId: string;
+  /** The consumed customer confirmation's ID — never token material. */
+  confirmationId: string | null;
   status: string;
   currentStage: string;
   oldSubscriptionId: string;
@@ -103,6 +105,7 @@ function parseProjection(value: unknown): AuditProjection | null {
   }
   return {
     operationId: value.operationId,
+    confirmationId: stringOrNull(value.confirmationId),
     status: value.status,
     currentStage: value.currentStage,
     oldSubscriptionId: value.oldSubscriptionId,
@@ -218,6 +221,14 @@ export function ReplacementAudit({ operationId }: ReplacementAuditProps) {
           <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
             <dt className="font-medium">Operation ID</dt>
             <dd className="font-mono text-xs">{operation.operationId}</dd>
+            {operation.confirmationId !== null ? (
+              <>
+                <dt className="font-medium">Customer confirmation</dt>
+                <dd className="font-mono text-xs">
+                  {operation.confirmationId}
+                </dd>
+              </>
+            ) : null}
             <dt className="font-medium">Status</dt>
             <dd className="font-mono text-xs">{operation.status}</dd>
             <dt className="font-medium">Current stage</dt>

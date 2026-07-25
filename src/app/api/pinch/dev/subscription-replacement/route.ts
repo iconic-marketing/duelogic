@@ -6,6 +6,12 @@ import {
   PinchConfigError,
   pinchRequest,
 } from "@/lib/pinch/client";
+import type { CustomerScheduleConfirmationRecord } from "@/lib/pinch/customer-confirmation";
+import {
+  evaluateConfirmationForReplacement,
+  consumeAcceptedCustomerConfirmation,
+} from "@/lib/pinch/customer-confirmation-service";
+import { getDevCustomerConfirmationRepository } from "@/lib/pinch/dev-customer-confirmation-store";
 import { getDevReplacementOperationRepository } from "@/lib/pinch/dev-replacement-operation-store";
 import type {
   SubscriptionReinstatementCreateBody,
@@ -150,6 +156,8 @@ interface ValidatedInput {
   subscriptionId: string;
   proposedStartDate: string;
   operationId: string;
+  /** The customer schedule confirmation this execution consumes. */
+  confirmationId: string;
   confirmedPayments: ConfirmedPayment[];
 }
 
@@ -160,6 +168,7 @@ const ALLOWED_INPUT_KEYS = new Set([
   "subscriptionId",
   "proposedStartDate",
   "operationId",
+  "confirmationId",
   "confirmation",
   "confirmedPayments",
 ]);
@@ -208,6 +217,10 @@ function validateInput(input: unknown): ValidatedInput | null {
   if (operationId === null || operationId.length > 100) {
     return null;
   }
+  const confirmationId = prefixedId(input.confirmationId, "conf_");
+  if (confirmationId === null || confirmationId.length > 100) {
+    return null;
+  }
   if (input.confirmation !== CONFIRMATION_PHRASE) {
     return null;
   }
@@ -247,6 +260,7 @@ function validateInput(input: unknown): ValidatedInput | null {
     subscriptionId,
     proposedStartDate: input.proposedStartDate,
     operationId,
+    confirmationId,
     confirmedPayments,
   };
 }
@@ -496,6 +510,35 @@ function apiFailure(reason: string, context: SafeLogContext): NextResponse {
   return NextResponse.json({ ok: false, stage: "api" }, { status: 502 });
 }
 
+/**
+ * Safe refusal for every customer-confirmation failure. All of these occur
+ * before any Pinch mutation, so the original subscription is untouched and
+ * none of them is a manual-recovery state. The response carries IDs and a
+ * stage only — never the raw token, token hash or confirmation record.
+ */
+function confirmationRefusal(
+  stage: string,
+  input: ValidatedInput,
+  context: SafeLogContext,
+  extra: Record<string, unknown> = {},
+): NextResponse {
+  console.error(
+    `Pinch dev subscription-replacement refused at stage "${stage}".`,
+    { ...context, confirmationId: input.confirmationId, ...extra },
+  );
+  return NextResponse.json(
+    {
+      ok: false,
+      stage,
+      operationId: input.operationId,
+      confirmationId: input.confirmationId,
+      originalSubscriptionUntouched: true,
+      ...extra,
+    },
+    { status: 409 },
+  );
+}
+
 export async function POST(request: NextRequest) {
   if (!isDirectLocalhostRequest(request)) {
     return new NextResponse(null, { status: 404 });
@@ -524,6 +567,63 @@ export async function POST(request: NextRequest) {
     payerId: input.payerId,
     oldSubscriptionId: input.subscriptionId,
   };
+
+  // -------------------------------------------------------------------
+  // Customer-confirmation gate — before any Pinch call. The server-held
+  // confirmation must exist, be accepted, unexpired and unused, and bind
+  // exactly this merchant, payer, source, subscription, proposed start
+  // date and confirmed payments. The plan binding is verified below once
+  // the read-only preflight has identified the subscription's plan. This
+  // proves customer consent only; the fresh Pinch preflight and
+  // confirmation-stale checks remain authoritative for schedule content.
+  // -------------------------------------------------------------------
+  let confirmationRecord: CustomerScheduleConfirmationRecord | null;
+  try {
+    confirmationRecord = await getDevCustomerConfirmationRepository().readById(
+      input.confirmationId,
+    );
+  } catch (error) {
+    console.error(
+      'Pinch dev subscription-replacement refused at stage "confirmation-store": the confirmation store could not be read, so no mutation was issued.',
+      { ...logContext, errorClass: errorClassOf(error) },
+    );
+    return NextResponse.json(
+      {
+        ok: false,
+        stage: "confirmation-store",
+        operationId: input.operationId,
+        confirmationId: input.confirmationId,
+        originalSubscriptionUntouched: true,
+      },
+      { status: 500 },
+    );
+  }
+  const confirmationCheck = evaluateConfirmationForReplacement(
+    confirmationRecord,
+    {
+      merchantId: input.merchantId,
+      payerId: input.payerId,
+      sourceId: input.sourceId,
+      subscriptionId: input.subscriptionId,
+      proposedStartDate: input.proposedStartDate,
+      confirmedPayments: input.confirmedPayments.map((payment) => ({
+        paymentDate: payment.transactionDate,
+        amountInCents: payment.amountCents,
+      })),
+    },
+    new Date().toISOString(),
+  );
+  if (!confirmationCheck.ok) {
+    return confirmationRefusal(
+      `confirmation-${confirmationCheck.reason}`,
+      input,
+      logContext,
+      confirmationCheck.mismatchField !== undefined
+        ? { mismatchField: confirmationCheck.mismatchField }
+        : {},
+    );
+  }
+  const confirmedPlanId = confirmationCheck.record.planId;
 
   const subscriptionPath = `subscriptions/${encodeURIComponent(input.subscriptionId)}`;
 
@@ -600,6 +700,14 @@ export async function POST(request: NextRequest) {
       );
     }
     logContext.planId = subscription.planId;
+
+    // The confirmation's plan binding, now that the read-only preflight has
+    // identified the subscription's plan. Still before any mutation.
+    if (confirmedPlanId !== subscription.planId) {
+      return confirmationRefusal("confirmation-mismatch", input, logContext, {
+        mismatchField: "planId",
+      });
+    }
 
     const plan = extractPlan(
       await pinchRequest<unknown>(
@@ -752,6 +860,21 @@ export async function POST(request: NextRequest) {
     // effect. Each effect below issues its Pinch call at most once.
     // -----------------------------------------------------------------
     const effects: ReplacementExecutionEffects = {
+      // Single-use consent consumption: runs inside the flow after every
+      // read-only preflight check above, before the recovery record is
+      // written and before any Pinch mutation. Touches only the
+      // confirmation store; a false return aborts with nothing mutated.
+      consumeCustomerConfirmation: async () =>
+        consumeAcceptedCustomerConfirmation(
+          {
+            confirmationId: input.confirmationId,
+            operationId: input.operationId,
+          },
+          {
+            repository: getDevCustomerConfirmationRepository(),
+            now: () => new Date().toISOString(),
+          },
+        ),
       cancelOriginal: async () => {
         await pinchRequest<unknown>(subscriptionPath, {
           method: "DELETE",
@@ -818,6 +941,7 @@ export async function POST(request: NextRequest) {
     const result = await executeSubscriptionReplacement(
       {
         operationId: input.operationId,
+        confirmationId: input.confirmationId,
         merchantId: input.merchantId,
         payerId: input.payerId,
         planId: subscription.planId,
@@ -835,6 +959,24 @@ export async function POST(request: NextRequest) {
       (message, context) => console.error(message, context),
     );
 
+    if (result.outcome === "confirmation-consumption-failed") {
+      // Nothing was persisted and nothing was mutated: the flow refuses to
+      // proceed unless the accepted confirmation is verifiably consumed.
+      console.error(
+        'Pinch dev subscription-replacement refused at stage "confirmation-consumption": the confirmation could not be verifiably consumed, so no mutation was issued.',
+        { ...logContext, confirmationId: input.confirmationId },
+      );
+      return NextResponse.json(
+        {
+          ok: false,
+          stage: "confirmation-consumption",
+          operationId: input.operationId,
+          confirmationId: input.confirmationId,
+          originalSubscriptionUntouched: true,
+        },
+        { status: 500 },
+      );
+    }
     if (result.outcome === "recovery-record-failed") {
       // Nothing was mutated: the flow never issues the DELETE unless the
       // recovery record was written and read back successfully.
@@ -922,6 +1064,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       ok: true,
       operationId: input.operationId,
+      confirmationId: input.confirmationId,
       merchantId: input.merchantId,
       payerId: input.payerId,
       sourceId: input.sourceId,

@@ -115,6 +115,13 @@ export interface VerifiedReplacementMapping {
 
 export interface SubscriptionReplacementOperationRecord {
   operationId: string;
+  /**
+   * The customer schedule confirmation consumed by this operation. The ID
+   * only — never the raw token, token hash or the confirmation record
+   * itself; the confirmation record remains the evidence of the exact
+   * accepted dates, amounts, acceptedAt and consumedAt.
+   */
+  confirmationId: string;
   merchantId: string;
   payerId: string;
   planId: string;
@@ -207,6 +214,8 @@ export function findForbiddenRecordKey(value: unknown): string | null {
  */
 export interface SafeReplacementOperationProjection {
   operationId: string;
+  /** The consumed customer confirmation's ID — never token material. */
+  confirmationId: string;
   status: SubscriptionReplacementOperationStatus;
   currentStage: SubscriptionReplacementOperationStage;
   oldSubscriptionId: string;
@@ -224,6 +233,7 @@ export function toSafeReplacementOperationProjection(
 ): SafeReplacementOperationProjection {
   return {
     operationId: record.operationId,
+    confirmationId: record.confirmationId,
     status: record.status,
     currentStage: record.currentStage,
     oldSubscriptionId: record.oldSubscriptionId,

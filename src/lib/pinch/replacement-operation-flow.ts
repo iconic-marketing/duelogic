@@ -32,6 +32,16 @@ import type {
  * most once per execution. Implementations must not retry internally.
  */
 export interface ReplacementExecutionEffects {
+  /**
+   * Atomically transitions the customer schedule confirmation from accepted
+   * to consumed for this operation — recording consumedAt and the operation
+   * ID — and verifies the transition by read-back. Returns true only for a
+   * verified transition. Not a Pinch effect: it touches only the
+   * confirmation store. Invoked exactly once, before the operation record
+   * is written and before any Pinch mutation; a false return or a throw
+   * aborts the flow with nothing persisted and nothing mutated.
+   */
+  consumeCustomerConfirmation(): Promise<boolean>;
   /** Issues the single DELETE for the original subscription. */
   cancelOriginal(): Promise<void>;
   /**
@@ -52,6 +62,8 @@ export interface ReplacementExecutionEffects {
 
 export interface ReplacementExecutionRequest {
   operationId: string;
+  /** The accepted customer confirmation this operation consumes. */
+  confirmationId: string;
   merchantId: string;
   payerId: string;
   planId: string;
@@ -73,6 +85,12 @@ export type SafeReplacementLog = (
 ) => void;
 
 export type ReplacementExecutionOutcome =
+  /**
+   * The customer confirmation could not be verifiably consumed; nothing was
+   * persisted and nothing was mutated. Not a manual-recovery state: the
+   * original subscription is untouched.
+   */
+  | { outcome: "confirmation-consumption-failed" }
   /** Record could not be written or read back; nothing was mutated. */
   | { outcome: "recovery-record-failed" }
   | {
@@ -219,7 +237,27 @@ export async function executeSubscriptionReplacement(
   });
 
   // -------------------------------------------------------------------
-  // Recovery record first. The original subscription must stay untouched
+  // Customer-consent gate first. The route has already completed every
+  // read-only Pinch preflight check before invoking this flow; the
+  // accepted confirmation must now be verifiably consumed (single-use,
+  // bound to this operation ID) before anything is persisted or mutated.
+  // A consumed confirmation is never reset automatically.
+  // -------------------------------------------------------------------
+  let confirmationConsumed = false;
+  try {
+    confirmationConsumed = await effects.consumeCustomerConfirmation();
+  } catch (error) {
+    logSafe(
+      "Subscription-replacement flow: customer-confirmation consumption threw.",
+      { ...safeContext, errorClass: errorClassOf(error) },
+    );
+  }
+  if (!confirmationConsumed) {
+    return { outcome: "confirmation-consumption-failed" };
+  }
+
+  // -------------------------------------------------------------------
+  // Recovery record next. The original subscription must stay untouched
   // unless the record — with its recovery snapshot — is durably* written
   // and read back. (*durably within the configured repository's own
   // guarantees; the dev store is process-local sandbox storage.)
@@ -227,6 +265,7 @@ export async function executeSubscriptionReplacement(
   const createdAt = now();
   let record: SubscriptionReplacementOperationRecord = {
     operationId: request.operationId,
+    confirmationId: request.confirmationId,
     merchantId: request.merchantId,
     payerId: request.payerId,
     planId: request.planId,

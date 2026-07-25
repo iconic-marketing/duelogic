@@ -97,6 +97,20 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - The mutation sequence runs in `src/lib/pinch/replacement-operation-flow.ts` with injected storage, effects and clock; its deterministic validation (`src/lib/pinch/replacement-operation-validation.ts`) never calls Pinch and is re-asserted by `GET /api/pinch/dev/replacement-operations?operationId=...`, the localhost-only lookup that returns the safe projection only.
 - Automated recovery or reinstatement is outside the MVP: the snapshot enables a human or a future recovery command; nothing executes it automatically.
 
+## Customer schedule confirmation
+
+- A permanent schedule replacement requires a separate, server-recorded customer confirmation; the merchant UI acknowledgement checkbox is an operator safeguard, never customer consent.
+- The confirmation record (`src/lib/pinch/customer-confirmation.ts`, service in `customer-confirmation-service.ts`) is bound to the exact merchant, payer, source, subscription, plan, proposed start date and the exact three payment dates and integer-cent amounts from the live Pinch preview; any mismatch refuses execution.
+- The live Pinch preflight remains authoritative for schedule content — the confirmation proves consent only and never replaces Pinch-side validation.
+- Confirmation links are time limited (30 minutes in development) and single use; expiry is evaluated server-side and client time is never authoritative.
+- Raw confirmation tokens (256-bit, Node crypto) are returned exactly once inside the customer URL at creation; only a SHA-256 hash is stored, and the raw token is never logged, never exposed by merchant lookup and never placed in the replacement audit record.
+- The customer responds through `/confirm/[token]` (localhost-only dev page) with explicit accept or decline; pending → accepted/declined, contradictory repeats are rejected, identical repeats are idempotent, expired and consumed records accept no response.
+- The replacement route requires an accepted, unexpired, unused confirmation and independently re-verifies every binding before any Pinch call; the confirmation is consumed (with operationId and consumedAt, verified by read-back) after all read-only preflight checks and before recovery-record persistence.
+- Any confirmation failure — pending, declined, expired, consumed, mismatched, store or consumption failure — aborts before any Pinch mutation and is never a manual-recovery state; manual-recovery-required remains reserved for failures after cancellation.
+- The replacement operation record and its safe projection carry `confirmationId` only — never token material or the confirmation record itself.
+- The confirmation store (`src/lib/pinch/dev-customer-confirmation-store.ts`, behind `CustomerConfirmationRepository`) is process-local, non-durable sandbox memory; the deterministic suite lives in `customer-confirmation-validation.ts` and is re-asserted by the dev confirmation routes and the dashboard render.
+- Email/SMS link delivery and durable confirmation persistence are polish-week work, outside the Build Weekend scope.
+
 ## Outcome events
 
 The proven payment lifecycle events are:

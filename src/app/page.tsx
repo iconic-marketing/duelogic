@@ -20,6 +20,7 @@ import {
   seedPaymentRecords,
   seedSummary,
 } from "@/lib/duelogic/seed-payment-history";
+import { validateCustomerConfirmationFlow } from "@/lib/pinch/customer-confirmation-validation";
 import { validateReplacementOperationRecovery } from "@/lib/pinch/replacement-operation-validation";
 import { MerchantSummary } from "./merchant-summary";
 import { PatternPanel } from "./pattern-panel";
@@ -75,6 +76,7 @@ export default async function DashboardPage() {
   const policyValidation = validatePolicyEngine();
   const planScheduleValidation = validatePlanScheduleResolver();
   const recoveryValidation = await validateReplacementOperationRecovery();
+  const confirmationValidation = await validateCustomerConfirmationFlow();
 
   const flags = detectTimingLinkedPatterns(seedPaymentRecords);
   const payersById = new Map(seedPayers.map((payer) => [payer.id, payer]));
@@ -170,7 +172,9 @@ export default async function DashboardPage() {
         detection ({seedValidation.flagCount} flags),{" "}
         {policyValidation.scenarioCount} policy-engine scenarios,{" "}
         {planScheduleValidation.scenarioCount} plan-schedule scenarios,{" "}
-        {recoveryValidation.scenarioCount} recovery-operation scenarios.
+        {recoveryValidation.scenarioCount} recovery-operation scenarios,{" "}
+        {confirmationValidation.scenarioCount} customer-confirmation
+        scenarios.
       </footer>
     </main>
   );
