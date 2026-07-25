@@ -159,7 +159,8 @@ export function PolicyConfigPanel({
       setCeilingInput("");
       setSuccess(
         `Policy ${nextView.active.policyVersion} is now active with an amount ceiling of ` +
-          `${formatAud(nextView.active.amountCeilingCents)}. Previous versions remain in history.`,
+          `${formatAud(nextView.active.amountCeilingCents)}. Previous versions remain in ` +
+          "history, and the replay and opportunity figures on this page now reflect the new version.",
       );
       router.refresh();
     } catch {
@@ -194,11 +195,11 @@ export function PolicyConfigPanel({
         MVP — every other rule stays fixed.
       </p>
       <p className="mb-4 text-xs text-zinc-500 dark:text-zinc-500">
-        Development note: the replay results, opportunity figures and Stage
-        1 interventions shown on this dashboard still evaluate under the
-        frozen default policy. They have not yet been switched to newly
-        activated versions, so those figures do not change when a new
-        version is activated here.
+        Development note: the replay results and opportunity figures on
+        this dashboard now evaluate under the active saved policy and
+        update after activation. Scheduled interventions and customer date
+        evaluation still use the frozen default policy until the next
+        controlled policy-binding stage.
       </p>
 
       {active === null ? (

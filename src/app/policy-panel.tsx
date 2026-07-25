@@ -2,6 +2,7 @@ import type {
   PolicyDecision,
   TemporaryPolicyEvaluationRequest,
 } from "@/lib/duelogic/policy/engine";
+import type { MerchantPolicySnapshotProjection } from "@/lib/duelogic/policy/policy-snapshot";
 import type { DueLogicPolicy, Payer } from "@/lib/duelogic/schema";
 import { formatAud, formatDisplayDate } from "@/lib/duelogic/display";
 
@@ -9,7 +10,10 @@ import { formatAud, formatDisplayDate } from "@/lib/duelogic/display";
  * Deterministic policy decisions, rendered exactly as the engine returned
  * them. Server component: the explanation, reason code, rule and warnings
  * are the engine's own output — nothing is reworded — and the governing
- * assumptions are displayed beside the result, not in a footnote.
+ * assumptions are displayed beside the result, not in a footnote. The
+ * decisions are evaluated under the active saved merchant policy snapshot,
+ * whose merchant-safe identity (version, activation time, ceiling, origin)
+ * is displayed above them — never the merchant ID or the full policy JSON.
  */
 
 interface PolicyEvaluationItem {
@@ -21,6 +25,22 @@ interface PolicyEvaluationItem {
 interface PolicyPanelProps {
   items: PolicyEvaluationItem[];
   policy: DueLogicPolicy;
+  /** Merchant-safe projection of the governing active snapshot. */
+  activeSnapshot: MerchantPolicySnapshotProjection | null;
+}
+
+const sydneyFormatter = new Intl.DateTimeFormat("en-AU", {
+  dateStyle: "medium",
+  timeStyle: "short",
+  timeZone: "Australia/Sydney",
+});
+
+function formatSydney(iso: string): string {
+  const parsed = Date.parse(iso);
+  if (Number.isNaN(parsed)) {
+    return iso;
+  }
+  return `${sydneyFormatter.format(new Date(parsed))} (Sydney time)`;
 }
 
 function outcomeBadge(decision: PolicyDecision) {
@@ -38,7 +58,7 @@ function outcomeBadge(decision: PolicyDecision) {
   );
 }
 
-export function PolicyPanel({ items, policy }: PolicyPanelProps) {
+export function PolicyPanel({ items, policy, activeSnapshot }: PolicyPanelProps) {
   return (
     <section className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
       <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -47,11 +67,33 @@ export function PolicyPanel({ items, policy }: PolicyPanelProps) {
           Deterministic policy evaluation
         </span>
       </div>
-      <p className="mb-4 text-zinc-600 dark:text-zinc-400">
+      <p className="mb-3 text-zinc-600 dark:text-zinc-400">
         Eligibility is decided by deterministic, versioned policy code. No AI
         model participates in these decisions, and every field below is the
-        engine&apos;s exact output.
+        engine&apos;s exact output. The decisions below are evaluated under
+        the merchant&apos;s active saved policy.
       </p>
+      {activeSnapshot !== null ? (
+        <dl className="mb-4 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+          <dt className="font-medium">Governing policy version</dt>
+          <dd className="font-mono text-xs">{activeSnapshot.policyVersion}</dd>
+          <dt className="font-medium">Activated</dt>
+          <dd>{formatSydney(activeSnapshot.activatedAt)}</dd>
+          <dt className="font-medium">Amount ceiling</dt>
+          <dd>{formatAud(activeSnapshot.amountCeilingCents)}</dd>
+          <dt className="font-medium">Origin</dt>
+          <dd>
+            {activeSnapshot.installedAsInitialDefault
+              ? "Installed initial default"
+              : "Merchant-activated version"}
+          </dd>
+        </dl>
+      ) : (
+        <p role="alert" className="mb-4 text-red-700 dark:text-red-400">
+          The active policy snapshot could not be read from the development
+          store; the decisions below use the frozen default policy.
+        </p>
+      )}
       <div className="flex flex-col gap-5">
         {items.map(({ payer, request, decision }) => (
           <div

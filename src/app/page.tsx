@@ -39,21 +39,30 @@ import { PolicyPanel } from "./policy-panel";
 import { ReplacementPanel } from "./replacement-panel";
 
 /**
- * The DueLogic merchant dashboard: one page over the frozen deterministic
+ * The DueLogic merchant dashboard: one page over the deterministic
  * capabilities. Sections 1-6 (summary, opportunity, history, detected
  * patterns, policy decisions) are server-rendered from the synthetic seed,
- * the detector and the policy engine — no Pinch call, no clock read, no
- * model output. The pattern flags and policy evaluations come from the
- * shared seed-policy-evaluations builder, and the merchant opportunity
- * panel aggregates those exact results — never a second evaluation
- * pathway. The live permanent-replacement journey is a client panel over
- * the existing localhost-only dev routes and fires nothing until its
- * button is pressed.
+ * the detector and the policy engine — no Pinch call, no model output.
+ * The pattern flags and policy evaluations come from the shared
+ * seed-policy-evaluations builder evaluated under the active saved
+ * merchant policy snapshot, and the merchant opportunity panel aggregates
+ * those exact results — never a second evaluation pathway. Scheduled
+ * interventions and customer date evaluation still use the frozen default
+ * policy until the next controlled binding stage. The live
+ * permanent-replacement journey is a client panel over the existing
+ * localhost-only dev routes and fires nothing until its button is pressed.
  *
  * Following the dev-route convention, the deterministic validation suites
  * are re-asserted on every render; any regression fails the render loudly
  * rather than showing stale claims.
  */
+
+// Render per request so the page always reads the current process-local
+// active policy snapshot: activating a policy then router.refresh() must
+// update the replay decisions, opportunity figures and displayed governing
+// version — never a build-time static snapshot. This does not change the
+// documented process-local persistence limitation.
+export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
   // Deterministic self-checks, re-asserted per render like the dev routes.
@@ -67,15 +76,22 @@ export default async function DashboardPage() {
   const interventionValidation = await validateInterventionFlow();
   const policySnapshotValidation = await validatePolicySnapshotFoundation();
 
-  // Merchant policy configuration state from the process-local development
-  // store: merchant-safe projections only reach the client panel. Every
-  // consumer below still evaluates under the frozen DEFAULT_DUELOGIC_POLICY
-  // — adoption of activated snapshots is a later controlled stage.
+  // Merchant policy state from the process-local development store:
+  // merchant-safe projections only reach the client panel. The active
+  // snapshot's complete policy governs the replay evaluations and the
+  // opportunity figures below — one evaluation pathway, stamped with the
+  // active version. Scheduled interventions and customer date evaluation
+  // still use the frozen DEFAULT_DUELOGIC_POLICY until the next controlled
+  // binding stage.
   const policyRepository = await getDevMerchantPolicyRepository();
   const policyView = await buildMerchantPolicyView(
     policyRepository,
     DEV_POLICY_MERCHANT_ID,
   );
+  const activeSnapshot = await policyRepository.readActive(
+    DEV_POLICY_MERCHANT_ID,
+  );
+  const governingPolicy = activeSnapshot?.policy ?? DEFAULT_DUELOGIC_POLICY;
 
   // Stage 1 monitoring data from the process-local development store:
   // merchant-safe projections only — never token material and never the
@@ -90,7 +106,8 @@ export default async function DashboardPage() {
     toMerchantInterventionProjection(record, interventionNowIso),
   );
 
-  const { flags, flaggedItems, policyItems } = buildSeedPolicyEvaluations();
+  const { flags, flaggedItems, policyItems } =
+    buildSeedPolicyEvaluations(governingPolicy);
   const opportunity = calculateMerchantOpportunity({
     payers: seedPayers,
     flags,
@@ -146,13 +163,20 @@ export default async function DashboardPage() {
       </header>
 
       <MerchantSummary merchant={seedMerchant} summary={seedSummary} />
-      <MerchantOpportunityPanel result={opportunity} />
+      <MerchantOpportunityPanel
+        result={opportunity}
+        governingPolicyVersion={governingPolicy.version}
+      />
       <PaymentHistory items={flaggedItems} records={seedPaymentRecords} />
       <PatternPanel
         items={flaggedItems}
         asOfDate={seedSummary.lastScheduledDate}
       />
-      <PolicyPanel items={policyItems} policy={DEFAULT_DUELOGIC_POLICY} />
+      <PolicyPanel
+        items={policyItems}
+        policy={governingPolicy}
+        activeSnapshot={policyView.active}
+      />
       <PolicyConfigPanel
         initialActive={policyView.active}
         initialHistory={policyView.history}

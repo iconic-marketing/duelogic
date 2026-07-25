@@ -8,12 +8,16 @@ import { formatAud, formatDisplayDate } from "@/lib/duelogic/display";
  * The merchant opportunity headline: four derived metrics and one compact
  * row per qualifying payer. Server component over the pure calculation —
  * every figure comes from the detector and the deterministic policy
- * evaluations already rendered further down the page, and nothing here
- * claims prevented dishonours, recovered revenue or any financial cause.
+ * evaluations already rendered further down the page (the same replay
+ * evaluation set, under the active saved merchant policy — never a second
+ * calculation), and nothing here claims prevented dishonours, recovered
+ * revenue or any financial cause.
  */
 
 interface MerchantOpportunityPanelProps {
   result: MerchantOpportunityResult;
+  /** The active saved policy version the displayed figures were calculated under. */
+  governingPolicyVersion: string;
 }
 
 const OUTCOME_LABELS: Record<MerchantOpportunityRow["policyOutcome"], string> =
@@ -45,6 +49,7 @@ function OutcomeCell({ row }: { row: MerchantOpportunityRow }) {
 
 export function MerchantOpportunityPanel({
   result,
+  governingPolicyVersion,
 }: MerchantOpportunityPanelProps) {
   return (
     <section className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
@@ -56,11 +61,15 @@ export function MerchantOpportunityPanel({
       </div>
       <p className="mb-1 text-zinc-600 dark:text-zinc-400">
         These upcoming payments are eligible for schedule review under the
-        displayed merchant policy.
+        merchant&apos;s active policy{" "}
+        <span className="font-mono text-xs">{governingPolicyVersion}</span>.
       </p>
       <p className="mb-4 text-xs text-zinc-500 dark:text-zinc-500">
-        This is not a claim that every future dishonour would have been
-        prevented.
+        These figures were calculated using the active policy version shown
+        above, from the same replay evaluation set as the policy decisions
+        further down this page — never a second calculation. Activating a
+        different policy version can change these figures. This is not a
+        claim that every future dishonour would have been prevented.
       </p>
 
       {result.outcome === "error" ? (

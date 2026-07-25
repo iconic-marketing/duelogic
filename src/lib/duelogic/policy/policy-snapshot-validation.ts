@@ -40,10 +40,31 @@
  * s12 the returned safe view cannot be mutated to change stored state;
  * s13 the frozen seed policy consumers still evaluate under the default
  *     policy version after an activation.
+ *
+ * The replay/opportunity adoption stage adds seven scenarios:
+ * s14 the no-argument replay builder still evaluates under
+ *     DEFAULT_DUELOGIC_POLICY and stamps duelogic-default-v1;
+ * s15 an activated snapshot's complete policy drives the replay and
+ *     stamps every decision with the activated policyVersion;
+ * s16 a lower active ceiling changes the relevant replay decisions
+ *     through the existing engine, leaving seed and detector unchanged;
+ * s17 opportunity figures derive from the same active-policy evaluations
+ *     and change consistently with those decisions;
+ * s18 the opportunity result and every replay decision carry the one
+ *     governing version passed to the dashboard panels;
+ * s19 a further activation updates replay and opportunity inputs without
+ *     changing the seed, the detector or the aggregation logic;
+ * s20 the no-argument path used by the scheduled intervention scan and
+ *     customer date evaluation remains frozen-default after activation.
  */
 
+import { calculateMerchantOpportunity } from "../merchant-opportunity";
 import type { DueLogicPolicy } from "../schema";
-import { buildSeedPolicyEvaluations } from "../seed-policy-evaluations";
+import { seedPayers } from "../seed-payment-history";
+import {
+  buildSeedPolicyEvaluations,
+  type SeedPolicyEvaluations,
+} from "../seed-policy-evaluations";
 import {
   createInMemoryMerchantPolicyRepository,
   DEV_POLICY_MERCHANT_ID,
@@ -137,6 +158,14 @@ async function expectRejection(
     return error;
   }
   throw new Error(`Policy snapshot validation failed: ${message}`);
+}
+
+/** The exact evaluation set the dashboard passes to the opportunity calc. */
+function toOpportunityEvaluations(evaluations: SeedPolicyEvaluations) {
+  return evaluations.policyItems.map(({ request, decision }) => ({
+    request,
+    decision,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +692,296 @@ export async function validatePolicySnapshotFoundation(): Promise<PolicySnapshot
     record("s13-consumers-remain-frozen", "frozen");
   }
 
-  check(table.length === 13, `expected 13 scenarios, produced ${table.length}`);
+  // s14: the no-argument replay builder still evaluates under
+  // DEFAULT_DUELOGIC_POLICY, stamps duelogic-default-v1, and behaves
+  // exactly as an explicit frozen-default call.
+  {
+    const noArg = buildSeedPolicyEvaluations();
+    check(
+      noArg.policyItems.length > 0 &&
+        noArg.policyItems.every(
+          (item) =>
+            item.decision.policyVersion === DEFAULT_DUELOGIC_POLICY.version,
+        ),
+      "s14: the no-argument builder must stamp duelogic-default-v1",
+    );
+    const explicit = buildSeedPolicyEvaluations(DEFAULT_DUELOGIC_POLICY);
+    check(
+      JSON.stringify(noArg) === JSON.stringify(explicit),
+      "s14: the no-argument builder must equal the explicit frozen-default call",
+    );
+    record("s14-no-argument-builder-frozen-default", "frozen-default");
+  }
+
+  // s15: an activated snapshot's complete policy drives the replay, and
+  // every returned decision is stamped with the activated policyVersion.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const outcome = await processPolicyActivationRequest(
+      { amountCeilingCents: 20_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    check(outcome.ok, "s15: the fixture activation must succeed");
+    const active = await repository.readActive(DEV_POLICY_MERCHANT_ID);
+    check(active !== null, "s15: the activated snapshot must be readable");
+    const evaluations = buildSeedPolicyEvaluations(
+      (active as MerchantPolicySnapshot).policy,
+    );
+    check(
+      evaluations.policyItems.length > 0 &&
+        evaluations.policyItems.every(
+          (item) => item.decision.policyVersion === "duelogic-policy-v2",
+        ),
+      "s15: every replay decision must be stamped with the activated policyVersion",
+    );
+    record("s15-replay-uses-activated-policy", "adopted");
+  }
+
+  // s16: a lower active ceiling ($200.00) changes the relevant replay
+  // decision through the existing deterministic engine — payer-02's
+  // $249.50 case escalates, the designated payer-01 opportunity stays
+  // approved — while the detector output and seed requests are unchanged.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    await processPolicyActivationRequest(
+      { amountCeilingCents: 20_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    const active = await repository.readActive(DEV_POLICY_MERCHANT_ID);
+    const defaults = buildSeedPolicyEvaluations();
+    const lowered = buildSeedPolicyEvaluations(
+      (active as MerchantPolicySnapshot).policy,
+    );
+    check(
+      JSON.stringify(lowered.flags) === JSON.stringify(defaults.flags),
+      "s16: the detector output must be identical under both policies",
+    );
+    check(
+      JSON.stringify(lowered.policyItems.map((item) => item.request)) ===
+        JSON.stringify(defaults.policyItems.map((item) => item.request)),
+      "s16: the evaluated seed requests must be unchanged",
+    );
+    const defaultPayer02 = defaults.policyItems.find(
+      (item) => item.request.payerId === "payer-02",
+    );
+    const loweredPayer02 = lowered.policyItems.find(
+      (item) => item.request.payerId === "payer-02",
+    );
+    const loweredPayer01 = lowered.policyItems.find(
+      (item) => item.request.payerId === "payer-01",
+    );
+    check(
+      defaultPayer02 !== undefined &&
+        defaultPayer02.decision.outcome === "approved",
+      "s16: payer-02 must be approved under the default ceiling",
+    );
+    check(
+      loweredPayer02 !== undefined &&
+        loweredPayer02.decision.outcome === "escalate" &&
+        loweredPayer02.decision.reasonCode === "AMOUNT_CEILING_EXCEEDED" &&
+        loweredPayer02.decision.ruleFired === "amountCeilingCents",
+      "s16: the $200.00 ceiling must escalate payer-02 through the existing engine rule",
+    );
+    check(
+      loweredPayer01 !== undefined &&
+        loweredPayer01.decision.outcome === "approved",
+      "s16: the designated payer-01 opportunity must remain approved",
+    );
+    record("s16-lower-ceiling-changes-decisions", "recalculated");
+  }
+
+  // s17: merchant opportunity figures derive from the same active-policy
+  // replay evaluations and change consistently with those decisions.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    await processPolicyActivationRequest(
+      { amountCeilingCents: 20_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    const active = await repository.readActive(DEV_POLICY_MERCHANT_ID);
+    const defaults = buildSeedPolicyEvaluations();
+    const lowered = buildSeedPolicyEvaluations(
+      (active as MerchantPolicySnapshot).policy,
+    );
+    const defaultOpportunity = calculateMerchantOpportunity({
+      payers: seedPayers,
+      flags: defaults.flags,
+      evaluations: toOpportunityEvaluations(defaults),
+    });
+    const loweredOpportunity = calculateMerchantOpportunity({
+      payers: seedPayers,
+      flags: lowered.flags,
+      evaluations: toOpportunityEvaluations(lowered),
+    });
+    check(
+      defaultOpportunity.outcome === "calculated" &&
+        defaultOpportunity.metrics.approvedInterventionCount === 2 &&
+        defaultOpportunity.metrics.eligibleAmountCents === 37_850,
+      "s17: the frozen-default figures must be 2 approved and 37850 cents",
+    );
+    check(
+      loweredOpportunity.outcome === "calculated" &&
+        loweredOpportunity.metrics.approvedInterventionCount === 1 &&
+        loweredOpportunity.metrics.eligibleAmountCents === 12_900 &&
+        loweredOpportunity.rows.length === 2,
+      "s17: the $200.00 figures must drop to 1 approved and 12900 cents with both rows visible",
+    );
+    const escalatedRow =
+      loweredOpportunity.outcome === "calculated"
+        ? loweredOpportunity.rows.find((row) => row.payerId === "payer-02")
+        : undefined;
+    const approvedRow =
+      loweredOpportunity.outcome === "calculated"
+        ? loweredOpportunity.rows.find((row) => row.payerId === "payer-01")
+        : undefined;
+    check(
+      escalatedRow !== undefined &&
+        escalatedRow.policyOutcome === "escalate" &&
+        !escalatedRow.approvedForReview &&
+        approvedRow !== undefined &&
+        approvedRow.approvedForReview,
+      "s17: the rows must restate the recalculated decisions consistently",
+    );
+    record("s17-opportunity-follows-replay", "consistent");
+  }
+
+  // s18: the opportunity result and every replay decision identify the
+  // same governing policy version through the data passed to the panels
+  // (the safe view's active projection and the decisions themselves).
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    await processPolicyActivationRequest(
+      { amountCeilingCents: 20_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    const view = await buildMerchantPolicyView(
+      repository,
+      DEV_POLICY_MERCHANT_ID,
+    );
+    const active = await repository.readActive(DEV_POLICY_MERCHANT_ID);
+    check(
+      view.active !== null &&
+        active !== null &&
+        view.active.policyVersion === "duelogic-policy-v2",
+      "s18: the panel projection must carry the activated version",
+    );
+    const governingVersion = view.active === null ? "" : view.active.policyVersion;
+    const evaluations = buildSeedPolicyEvaluations(
+      (active as MerchantPolicySnapshot).policy,
+    );
+    check(
+      evaluations.policyItems.every(
+        (item) => item.decision.policyVersion === governingVersion,
+      ),
+      "s18: every replay decision must carry the version passed to the panels",
+    );
+    const opportunity = calculateMerchantOpportunity({
+      payers: seedPayers,
+      flags: evaluations.flags,
+      evaluations: toOpportunityEvaluations(evaluations),
+    });
+    check(
+      opportunity.outcome === "calculated" &&
+        evaluations.policyItems.every((item) => {
+          const row = opportunity.rows.find(
+            (candidate) => candidate.payerId === item.request.payerId,
+          );
+          return (
+            row !== undefined &&
+            row.policyOutcome === item.decision.outcome &&
+            row.reasonCode === item.decision.reasonCode
+          );
+        }),
+      "s18: the opportunity rows must restate the same governed decisions",
+    );
+    record("s18-one-governing-version", "aligned");
+  }
+
+  // s19: activating a further policy updates the replay and opportunity
+  // inputs while the seed, the detector and the aggregation logic stay
+  // unchanged — a $300.00 ceiling restores both approvals.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const deps = {
+      repository,
+      merchantId: DEV_POLICY_MERCHANT_ID,
+      now: clock,
+    };
+    await processPolicyActivationRequest({ amountCeilingCents: 20_000 }, deps);
+    const second = await processPolicyActivationRequest(
+      { amountCeilingCents: 30_000 },
+      deps,
+    );
+    check(second.ok, "s19: the second activation must succeed");
+    const active = await repository.readActive(DEV_POLICY_MERCHANT_ID);
+    const defaults = buildSeedPolicyEvaluations();
+    const latest = buildSeedPolicyEvaluations(
+      (active as MerchantPolicySnapshot).policy,
+    );
+    check(
+      JSON.stringify(latest.flags) === JSON.stringify(defaults.flags) &&
+        JSON.stringify(latest.policyItems.map((item) => item.request)) ===
+          JSON.stringify(defaults.policyItems.map((item) => item.request)),
+      "s19: the seed and detector inputs must be unchanged across activations",
+    );
+    check(
+      latest.policyItems.every(
+        (item) => item.decision.policyVersion === "duelogic-policy-v3",
+      ),
+      "s19: the replay must follow the newest activated version",
+    );
+    const first = calculateMerchantOpportunity({
+      payers: seedPayers,
+      flags: latest.flags,
+      evaluations: toOpportunityEvaluations(latest),
+    });
+    const repeat = calculateMerchantOpportunity({
+      payers: seedPayers,
+      flags: latest.flags,
+      evaluations: toOpportunityEvaluations(latest),
+    });
+    check(
+      JSON.stringify(first) === JSON.stringify(repeat),
+      "s19: the opportunity aggregation must be deterministic and unchanged",
+    );
+    check(
+      first.outcome === "calculated" &&
+        first.metrics.approvedInterventionCount === 2 &&
+        first.metrics.eligibleAmountCents === 37_850,
+      "s19: the $300.00 ceiling must restore both approvals through the same aggregation",
+    );
+    record("s19-new-activation-updates-inputs-only", "updated");
+  }
+
+  // s20: no scheduled intervention or customer evaluation consumer is
+  // switched in this stage — the no-argument builder path those flows use
+  // still produces frozen-default approved decisions after an activation.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    await processPolicyActivationRequest(
+      { amountCeilingCents: 20_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    const frozen = buildSeedPolicyEvaluations();
+    check(
+      frozen.policyItems.length > 0 &&
+        frozen.policyItems.every(
+          (item) =>
+            item.decision.policyVersion === DEFAULT_DUELOGIC_POLICY.version &&
+            item.decision.outcome === "approved",
+        ),
+      "s20: the no-argument path used by the scan and customer evaluation must stay frozen-default",
+    );
+    record("s20-intervention-and-customer-paths-frozen", "frozen");
+  }
+
+  check(table.length === 20, `expected 20 scenarios, produced ${table.length}`);
   return { scenarioCount: table.length, decisionTable: table };
 }
 

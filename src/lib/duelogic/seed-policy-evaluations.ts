@@ -14,7 +14,7 @@ import {
   type TemporaryPolicyEvaluationRequest,
 } from "./policy/engine";
 import { DEFAULT_DUELOGIC_POLICY } from "./policy/rules";
-import type { PatternFlag, Payer } from "./schema";
+import type { DueLogicPolicy, PatternFlag, Payer } from "./schema";
 import {
   seedPayers,
   seedPaymentRecords,
@@ -62,11 +62,20 @@ export interface SeedPolicyEvaluations {
 
 /**
  * Runs the detector over the frozen seed and evaluates each flagged payer's
- * next seeded debit against the default policy. Pure and deterministic: the
- * evaluation date is fixed to the end of the seeded history and arrears are
- * supplied explicitly as zero.
+ * next seeded debit against the supplied policy. Pure and deterministic:
+ * the evaluation date is fixed to the end of the seeded history and arrears
+ * are supplied explicitly as zero. The engine stamps every decision with
+ * the supplied policy's own version.
+ *
+ * The default argument is the frozen DEFAULT_DUELOGIC_POLICY: the Stage 1
+ * scheduled intervention scan (and any other caller that supplies no
+ * policy) continues to evaluate under duelogic-default-v1 until the
+ * separate intervention-binding stage. The dashboard passes the active
+ * saved merchant policy snapshot's policy.
  */
-export function buildSeedPolicyEvaluations(): SeedPolicyEvaluations {
+export function buildSeedPolicyEvaluations(
+  policy: DueLogicPolicy = DEFAULT_DUELOGIC_POLICY,
+): SeedPolicyEvaluations {
   const flags = detectTimingLinkedPatterns(seedPaymentRecords);
   const payersById = new Map(seedPayers.map((payer) => [payer.id, payer]));
 
@@ -98,11 +107,7 @@ export function buildSeedPolicyEvaluations(): SeedPolicyEvaluations {
         currentPaymentDate: nextDebit.currentPaymentDate,
         requestedDate,
       };
-      const decision = evaluateScheduleChange(
-        request,
-        [],
-        DEFAULT_DUELOGIC_POLICY,
-      );
+      const decision = evaluateScheduleChange(request, [], policy);
       return [{ payer, request, decision }];
     },
   );
