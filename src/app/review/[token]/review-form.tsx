@@ -102,6 +102,10 @@ function ScheduleList({
 
 type ConfirmState = "idle" | "submitting" | "submitted";
 
+/** Barebones OTP panel state: has a code been sent, and is a call running. */
+type OtpPhase = "idle" | "sent";
+type OtpBusy = "none" | "requesting" | "verifying";
+
 export function ReviewForm({ token, initialView }: ReviewFormProps) {
   const [view, setView] = useState<CustomerInterventionProjection>(initialView);
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -112,6 +116,115 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
   /** Latched away from "idle" on the first confirm click; never reset. */
   const [confirmState, setConfirmState] = useState<ConfirmState>("idle");
   const [confirmNotice, setConfirmNotice] = useState<string | null>(null);
+  const [otpPhase, setOtpPhase] = useState<OtpPhase>("idle");
+  const [otpBusy, setOtpBusy] = useState<OtpBusy>("none");
+  const [otpMaskedMobile, setOtpMaskedMobile] = useState<string | null>(null);
+  const [otpCode, setOtpCode] = useState("");
+  const [otpNotice, setOtpNotice] = useState<string | null>(null);
+
+  // The OTP never appears in these responses or on this page: the code is
+  // delivered only through the separate simulated SMS channel. The server
+  // holds every decision — this panel just sends { token } / { token, code }
+  // and renders the reported state. Duplicate submissions are latched via
+  // otpBusy; no automatic confirmation follows a successful verification.
+  const requestOtpCode = async () => {
+    if (otpBusy !== "none" || confirmState !== "idle") {
+      return;
+    }
+    setOtpBusy("requesting");
+    setOtpNotice(null);
+    try {
+      const response = await fetch(
+        "/api/duelogic/dev/interventions/otp/request",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        },
+      );
+      const body: unknown = await response.json().catch(() => null);
+      const reported = viewFromResponse(body);
+      if (reported !== null) {
+        setView(reported);
+      }
+      if (response.ok && isRecord(body) && body.ok === true) {
+        setOtpMaskedMobile(
+          typeof body.maskedMobile === "string" ? body.maskedMobile : null,
+        );
+        setOtpPhase("sent");
+        setOtpCode("");
+        return;
+      }
+      const stage = isRecord(body) ? body.stage : undefined;
+      if (stage === "mobile-unavailable" || stage === "mobile-invalid") {
+        setOtpNotice(
+          "A mobile number could not be found for your account, so a code cannot be sent. Please contact the merchant.",
+        );
+        return;
+      }
+      setOtpNotice(
+        "A verification code could not be sent just now. Please try again shortly.",
+      );
+    } catch {
+      setOtpNotice(
+        "A verification code could not be sent just now. Please try again shortly.",
+      );
+    } finally {
+      setOtpBusy("none");
+    }
+  };
+
+  const verifyOtpCode = async () => {
+    if (
+      otpBusy !== "none" ||
+      confirmState !== "idle" ||
+      !/^\d{6}$/.test(otpCode)
+    ) {
+      return;
+    }
+    setOtpBusy("verifying");
+    setOtpNotice(null);
+    try {
+      const response = await fetch(
+        "/api/duelogic/dev/interventions/otp/verify",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, code: otpCode }),
+        },
+      );
+      const body: unknown = await response.json().catch(() => null);
+      const reported = viewFromResponse(body);
+      if (reported !== null) {
+        // A successful verification reports finalConfirmationEnabled true —
+        // derived server-side from the created verification record. The
+        // customer still confirms separately below; nothing auto-confirms.
+        setView(reported);
+      }
+      if (response.ok && isRecord(body) && body.ok === true) {
+        setOtpCode("");
+        return;
+      }
+      const stage = isRecord(body) ? body.stage : undefined;
+      if (stage === "otp-incorrect") {
+        setOtpNotice(
+          "That code is not correct. Please check the latest code and try again.",
+        );
+        return;
+      }
+      if (stage === "otp-expired") {
+        setOtpNotice("That code has expired. Please send a new code.");
+        return;
+      }
+      setOtpNotice("That code is no longer valid. Please send a new code.");
+    } catch {
+      setOtpNotice(
+        "Your code could not be checked just now. Please try again shortly.",
+      );
+    } finally {
+      setOtpBusy("none");
+    }
+  };
 
   const submit = async (
     payload:
@@ -452,6 +565,109 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
               {formatDisplayDate(view.selectedDate)}
             </p>
           ) : null}
+          {!view.finalConfirmationEnabled ? (
+            <div className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+              <p className="font-medium">Verify it&rsquo;s you</p>
+              <p className="mt-1 text-zinc-600 dark:text-zinc-400">
+                We&rsquo;ll send a verification code to the mobile number
+                held on your payer record.
+              </p>
+              {otpMaskedMobile !== null && otpPhase === "sent" ? (
+                <p className="mt-2">
+                  A code was sent to{" "}
+                  <span className="font-medium">{otpMaskedMobile}</span>. It
+                  expires in 5 minutes.
+                </p>
+              ) : null}
+              <div className="mt-3 flex flex-wrap items-end gap-3">
+                {otpPhase === "sent" ? (
+                  <>
+                    <label className="flex flex-col gap-1">
+                      <span className="text-xs font-medium text-zinc-500 dark:text-zinc-500">
+                        6-digit code
+                      </span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        pattern="\d{6}"
+                        maxLength={6}
+                        value={otpCode}
+                        onChange={(event) => {
+                          setOtpCode(
+                            event.target.value.replace(/\D/g, "").slice(0, 6),
+                          );
+                        }}
+                        className="w-32 rounded border border-zinc-300 px-3 py-1.5 font-mono tracking-widest dark:border-zinc-700 dark:bg-zinc-900"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="rounded bg-zinc-900 px-4 py-1.5 font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+                      onClick={() => {
+                        void verifyOtpCode();
+                      }}
+                      disabled={
+                        otpBusy !== "none" ||
+                        confirmState !== "idle" ||
+                        !/^\d{6}$/.test(otpCode)
+                      }
+                    >
+                      {otpBusy === "verifying" ? "Checking…" : "Verify code"}
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded border border-zinc-300 px-4 py-1.5 font-medium disabled:opacity-50 dark:border-zinc-700"
+                      onClick={() => {
+                        void requestOtpCode();
+                      }}
+                      disabled={otpBusy !== "none" || confirmState !== "idle"}
+                    >
+                      {otpBusy === "requesting"
+                        ? "Sending…"
+                        : "Send a new code"}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="rounded bg-zinc-900 px-4 py-1.5 font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+                    onClick={() => {
+                      void requestOtpCode();
+                    }}
+                    disabled={otpBusy !== "none" || confirmState !== "idle"}
+                  >
+                    {otpBusy === "requesting"
+                      ? "Sending…"
+                      : "Send verification code"}
+                  </button>
+                )}
+              </div>
+              {otpNotice !== null ? (
+                <p
+                  role="alert"
+                  className="mt-2 text-amber-700 dark:text-amber-400"
+                >
+                  {otpNotice}
+                </p>
+              ) : null}
+              <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-500">
+                Development note: simulated SMS messages are delivered to
+                the{" "}
+                <a
+                  href="/dev/duelogic/sms"
+                  className="underline underline-offset-4"
+                >
+                  development SMS inbox
+                </a>
+                .
+              </p>
+            </div>
+          ) : (
+            <p className="font-medium text-green-800 dark:text-green-400">
+              Mobile verification complete.
+            </p>
+          )}
           <div>
             <button
               type="button"
