@@ -44,6 +44,8 @@ const STATUS_LABELS: Array<{
   { key: "declined", label: "Declined" },
   { key: "escalated", label: "Escalated" },
   { key: "expired", label: "Expired" },
+  { key: "executed", label: "Executed" },
+  { key: "manualRecoveryRequired", label: "Manual recovery" },
 ];
 
 export function InterventionPanel({
@@ -107,7 +109,7 @@ export function InterventionPanel({
           Customer-led schedule corrections
         </h2>
         <span className="rounded-full bg-sky-100 px-2.5 py-0.5 text-xs font-medium text-sky-900 dark:bg-sky-950 dark:text-sky-300">
-          Stage 1 — preview only
+          Execution gated — customer verification pending
         </span>
       </div>
       <p className="mb-4 text-zinc-600 dark:text-zinc-400">

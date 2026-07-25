@@ -7,6 +7,7 @@ import {
   hashInterventionToken,
   openIntervention,
 } from "@/lib/duelogic/intervention-service";
+import { createEmptyDevTransactionVerificationRepository } from "@/lib/duelogic/transaction-verification";
 import { ReviewForm } from "./review-form";
 
 /**
@@ -67,9 +68,19 @@ export default async function CustomerReviewPage({
     );
   }
 
+  // Server-derived verification state. The development repository is
+  // deliberately empty (no write path exists), so this is always null
+  // today and finalConfirmationEnabled resolves false from the missing
+  // verified record — never from a hardcoded flag.
+  const verification =
+    await createEmptyDevTransactionVerificationRepository().readVerifiedForIntervention(
+      record.interventionId,
+    );
+
   const view = toCustomerInterventionProjection(
     record,
     new Date().toISOString(),
+    verification,
   );
 
   return (

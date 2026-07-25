@@ -7,17 +7,24 @@ import type { ConfirmedSchedulePayment } from "@/lib/pinch/customer-confirmation
 
 /**
  * Client half of the customer intervention page: date selection, the
- * "Check this date" evaluation, decline, and the exact-schedule preview.
- * Every state change comes from the server's response — client time is
- * never authoritative, the server re-evaluates expiry, status and policy
- * on each request, and the browser supplies nothing but the token, the
- * action and the chosen date. Shows plain customer language only; no IDs,
- * reason codes or raw JSON.
+ * "Check this date" evaluation, decline, the exact-schedule preview, and
+ * the Stage 2 final confirmation. Every state change comes from the
+ * server's response — client time is never authoritative, the server
+ * re-evaluates expiry, status and policy on each request, and the browser
+ * supplies nothing but the token, the action and the chosen date. Shows
+ * plain customer language only; no IDs, reason codes or raw JSON.
  *
- * The final "Confirm and apply this schedule" button is the Stage 2 seam:
- * it is rendered visibly disabled, wired to no handler, no route and no
- * Pinch operation. Stage 2 will enable it and connect one server-side
- * handler to the existing protected replacement path.
+ * The final confirmation is gated and a single submission: the server
+ * computes finalConfirmationEnabled, which additionally requires a valid
+ * verified customer transaction-verification record — none can currently
+ * be created, so the confirm button renders disabled with wording that
+ * verification is required, and this page never calls the confirmation
+ * route while the flag is false. When enabled (future verified path), the
+ * button disables the moment it is clicked and never re-enables, and no
+ * retry control exists. The server holds the only execution authority —
+ * one gated handler behind the confirm route, which invokes the existing
+ * protected replacement path unchanged. An ambiguous or manual-recovery
+ * outcome renders calm neutral wording with no instruction to resubmit.
  */
 
 interface ReviewFormProps {
@@ -93,6 +100,8 @@ function ScheduleList({
   );
 }
 
+type ConfirmState = "idle" | "submitting" | "submitted";
+
 export function ReviewForm({ token, initialView }: ReviewFormProps) {
   const [view, setView] = useState<CustomerInterventionProjection>(initialView);
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -100,13 +109,16 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
   );
   const [requestState, setRequestState] = useState<RequestState>("idle");
   const [selectionNotice, setSelectionNotice] = useState<string | null>(null);
+  /** Latched away from "idle" on the first confirm click; never reset. */
+  const [confirmState, setConfirmState] = useState<ConfirmState>("idle");
+  const [confirmNotice, setConfirmNotice] = useState<string | null>(null);
 
   const submit = async (
     payload:
       | { token: string; action: "check-date"; selectedDate: string }
       | { token: string; action: "decline" },
   ) => {
-    if (requestState === "submitting") {
+    if (requestState === "submitting" || confirmState !== "idle") {
       return;
     }
     setRequestState("submitting");
@@ -150,6 +162,97 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
     }
   };
 
+  const confirmSchedule = async () => {
+    // Never call the confirmation route while the server-computed gate is
+    // closed: without a verified transaction-verification record the
+    // server would refuse anyway, and this page must not even ask. The
+    // remaining guards cover single submission and programmatic re-entry;
+    // none ever re-enables.
+    if (
+      !view.finalConfirmationEnabled ||
+      confirmState !== "idle" ||
+      requestState === "submitting"
+    ) {
+      return;
+    }
+    setConfirmState("submitting");
+    setConfirmNotice(null);
+    try {
+      const response = await fetch("/api/duelogic/dev/interventions/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      const reported = viewFromResponse(body);
+      if (reported !== null) {
+        // The reported status ("executed", "executing",
+        // "manual-recovery-required" or a reverted "preview-ready") drives
+        // what renders below.
+        setView(reported);
+      }
+      if (response.ok && isRecord(body) && body.ok === true) {
+        setConfirmState("submitted");
+        return;
+      }
+      const stage = isRecord(body) ? body.stage : undefined;
+      if (stage === "refused") {
+        setConfirmNotice(
+          "The schedule change could not be completed just now. No changes have been made to your payment schedule.",
+        );
+      } else if (reported === null) {
+        // The outcome could not be read. Calm, neutral, no instruction to
+        // resubmit: the server never re-executes and the merchant follows
+        // up on anything unresolved.
+        setConfirmNotice(
+          "Your confirmation has been received. The update is being finalised — you don't need to do anything further, and the merchant will contact you if anything needs your attention.",
+        );
+      }
+      setConfirmState("submitted");
+    } catch {
+      setConfirmNotice(
+        "Your confirmation has been received. The update is being finalised — you don't need to do anything further, and the merchant will contact you if anything needs your attention.",
+      );
+      setConfirmState("submitted");
+    }
+  };
+
+  if (view.status === "executed") {
+    return (
+      <div className="mt-4 flex flex-col gap-4">
+        <p className="font-medium text-green-800 dark:text-green-400">
+          Your new payment schedule is confirmed.
+        </p>
+        {view.proposedPayments !== null ? (
+          <ScheduleList
+            title="Your new schedule (verified next three payments)"
+            payments={view.proposedPayments}
+          />
+        ) : null}
+        <p className="text-zinc-600 dark:text-zinc-400">
+          These dates and amounts have been verified with the payment
+          provider. No further action is needed.
+        </p>
+      </div>
+    );
+  }
+  if (
+    view.status === "executing" ||
+    view.status === "manual-recovery-required"
+  ) {
+    // Calm neutral wording for an in-flight or attention-needed outcome:
+    // no alarm, no instruction to resubmit — the merchant follows up.
+    return (
+      <div className="mt-4 flex flex-col gap-3">
+        <p className="font-medium">Your confirmation has been received.</p>
+        <p className="text-zinc-600 dark:text-zinc-400">
+          The schedule update is being finalised. You don&rsquo;t need to do
+          anything further — the merchant will contact you if anything needs
+          your attention.
+        </p>
+      </div>
+    );
+  }
   if (view.status === "expired") {
     return (
       <p className="mt-4" role="alert">
@@ -255,7 +358,7 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
           onClick={() => {
             void submit({ token, action: "check-date", selectedDate });
           }}
-          disabled={submitting || selectedDate === ""}
+          disabled={submitting || selectedDate === "" || confirmState !== "idle"}
         >
           {submitting ? "Checking…" : "Check this date"}
         </button>
@@ -352,16 +455,41 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
           <div>
             <button
               type="button"
-              className="cursor-not-allowed rounded bg-zinc-300 px-4 py-1.5 font-medium text-zinc-500 dark:bg-zinc-700 dark:text-zinc-400"
-              disabled
+              className="rounded bg-green-700 px-4 py-1.5 font-medium text-white disabled:bg-zinc-300 disabled:text-zinc-500 dark:bg-green-600 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500"
+              onClick={() => {
+                void confirmSchedule();
+              }}
+              disabled={
+                !view.finalConfirmationEnabled ||
+                confirmState !== "idle" ||
+                submitting
+              }
             >
-              Confirm and apply this schedule
+              {confirmState === "submitting"
+                ? "Confirming…"
+                : confirmState === "submitted"
+                  ? "Confirmation submitted"
+                  : "Confirm and apply this schedule"}
             </button>
-            <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-500">
-              Final confirmation and automatic application will be enabled in
-              the next implementation stage.
-            </p>
+            {view.finalConfirmationEnabled ? (
+              <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-500">
+                Confirming permanently replaces your recurring schedule with
+                the exact dates and amounts shown above. Your confirmation
+                is submitted once.
+              </p>
+            ) : (
+              <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-500">
+                Customer verification is required before this schedule
+                change can be applied. The confirm button stays disabled
+                until that verification step is complete.
+              </p>
+            )}
           </div>
+          {confirmNotice !== null ? (
+            <p role="alert" className="text-zinc-700 dark:text-zinc-300">
+              {confirmNotice}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -372,7 +500,7 @@ export function ReviewForm({ token, initialView }: ReviewFormProps) {
           onClick={() => {
             void submit({ token, action: "decline" });
           }}
-          disabled={submitting}
+          disabled={submitting || confirmState !== "idle"}
         >
           Decline — keep my current schedule
         </button>

@@ -1,18 +1,33 @@
 /**
- * Stage 1 customer-led intervention service: the scheduled scan, customer
- * open, deterministic date evaluation with read-only Pinch preview, and
- * decline.
+ * Customer-led intervention service: the scheduled scan, customer open,
+ * deterministic date evaluation with read-only Pinch preview, decline, and
+ * (Stage 2) customer-confirmed execution through the existing protected
+ * replacement path.
  *
  * Every function takes injected dependencies (repositories, clock, token
- * generator, token hasher, read-only subscription/preview effects), so the
- * deterministic validation suite drives these exact code paths with fakes
- * and no network access. The dev routes supply the real implementations.
+ * generator, token hasher, read-only subscription/preview effects, and the
+ * replacement-path invoker), so the deterministic validation suite drives
+ * these exact code paths with fakes and no network access. The dev routes
+ * supply the real implementations.
  *
- * Nothing here mutates Pinch: every injected Pinch effect is a read, Stage
- * 1 stops at preview-ready, and confirmationId, operationId and
- * newSubscriptionId remain null throughout. The deterministic policy engine
- * decides eligibility; Pinch remains authoritative for schedule content —
- * preview dates are never generated or substituted locally.
+ * Nothing in THIS module mutates Pinch: every injected Pinch effect here is
+ * a read, and execution happens only inside the injected
+ * executeReplacementPath — the existing protected replacement route/flow,
+ * invoked unchanged, which performs its own fresh Pinch preflight,
+ * confirmation consumption, recovery-record write, cancellation, creation
+ * and verification, and never retries a mutation. The deterministic policy
+ * engine decides eligibility; Pinch remains authoritative for schedule
+ * content — preview dates are never generated or substituted locally.
+ *
+ * Execution is gated (CLAUDE.md "Customer transaction verification"):
+ * possession of the tokenised review link alone never authorises a
+ * mutation. Every customer-facing surface must pass
+ * requireTransactionVerification — which demands a valid verified
+ * transaction-verification record bound to the exact intervention and
+ * schedule — before confirmInterventionExecution may be called. No write
+ * path for verification records exists yet, so the gate refuses everywhere
+ * today; the later OTP stage adds record creation without changing
+ * confirmInterventionExecution.
  */
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -21,6 +36,7 @@ import {
   DEV_INTERVENTION_INVITATION_LIFETIME_MINUTES,
   effectiveInterventionStatus,
   findForbiddenInterventionRecordKey,
+  transactionVerificationExpectationFor,
   type DueLogicInterventionRecord,
   type DueLogicInterventionRepository,
   type InterventionCustomerNotification,
@@ -41,7 +57,17 @@ import {
   type SubscriptionDetailSnapshot,
   type SubscriptionReadEffects,
 } from "./subscription-resolver";
+import {
+  evaluateTransactionVerification,
+  type TransactionVerificationRecord,
+  type TransactionVerificationRepository,
+} from "./transaction-verification";
 import type { ConfirmedSchedulePayment } from "@/lib/pinch/customer-confirmation";
+import {
+  createCustomerConfirmation,
+  respondToCustomerConfirmation,
+  type CustomerConfirmationServiceDeps,
+} from "@/lib/pinch/customer-confirmation-service";
 
 // Mirrors the runtime server-only guard in src/lib/pinch/client.ts: the
 // `server-only` package is not installed in this project, so fail at import
@@ -760,16 +786,25 @@ export type DeclineInterventionOutcome =
   | { ok: true; changed: boolean; record: DueLogicInterventionRecord }
   | {
       ok: false;
-      reason: "not-found" | "expired" | "escalated" | "store";
+      reason:
+        | "not-found"
+        | "expired"
+        | "escalated"
+        | "executing"
+        | "executed"
+        | "manual-recovery-required"
+        | "store";
       record?: DueLogicInterventionRecord;
     };
 
 /**
  * Applies a customer's decline. Permitted from any pre-execution state;
  * repeats are idempotent; expired invitations accept no response; an
- * escalated case stays with the merchant. Declining performs no Pinch call,
- * creates no confirmation record and leaves confirmationId, operationId
- * and newSubscriptionId null.
+ * escalated case stays with the merchant; once execution has begun
+ * (executing, executed or manual-recovery-required) a decline is refused —
+ * an executed or in-flight replacement cannot be undone by declining.
+ * Declining performs no Pinch call, creates no confirmation record and
+ * leaves confirmationId, operationId and newSubscriptionId null.
  */
 export async function declineIntervention(
   input: { token: string },
@@ -786,7 +821,13 @@ export async function declineIntervention(
   if (status === "declined") {
     return { ok: true, changed: false, record };
   }
-  if (status === "expired" || status === "escalated") {
+  if (
+    status === "expired" ||
+    status === "escalated" ||
+    status === "executing" ||
+    status === "executed" ||
+    status === "manual-recovery-required"
+  ) {
     return { ok: false, reason: status, record };
   }
   const declined: DueLogicInterventionRecord = {
@@ -800,6 +841,333 @@ export async function declineIntervention(
     return { ok: false, reason: "store", record };
   }
   return { ok: true, changed: true, record: declined };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: transaction-verification gate
+
+export interface TransactionVerificationGateDeps {
+  repository: DueLogicInterventionRepository;
+  /** Read-only; the development implementation always returns null. */
+  verifications: TransactionVerificationRepository;
+  now(): string;
+  hashToken(rawToken: string): string;
+}
+
+export type TransactionVerificationGateOutcome =
+  | {
+      ok: true;
+      record: DueLogicInterventionRecord;
+      verification: TransactionVerificationRecord;
+    }
+  | {
+      ok: false;
+      reason: "not-found" | "verification-required";
+      record?: DueLogicInterventionRecord;
+    };
+
+/**
+ * The mandatory gate in front of confirmInterventionExecution: resolves
+ * the intervention from its hashed token and requires a valid verified
+ * transaction-verification record bound to the exact intervention,
+ * merchant, payer, subscription, selected date, stored schedules and
+ * policy version — unexpired and unconsumed. Any missing, mismatched,
+ * expired, consumed or unreadable verification refuses; an unreadable
+ * store never permits. Token possession alone therefore never reaches the
+ * execution entry point. No write path for verification records exists
+ * yet, so this gate refuses everywhere today.
+ */
+export async function requireTransactionVerification(
+  input: { token: string },
+  deps: TransactionVerificationGateDeps,
+): Promise<TransactionVerificationGateOutcome> {
+  const record = await deps.repository.readByTokenHash(
+    deps.hashToken(input.token.trim()),
+  );
+  if (record === null) {
+    return { ok: false, reason: "not-found" };
+  }
+  let verification: TransactionVerificationRecord | null = null;
+  try {
+    verification = await deps.verifications.readVerifiedForIntervention(
+      record.interventionId,
+    );
+  } catch {
+    verification = null;
+  }
+  const evaluation = evaluateTransactionVerification(
+    verification,
+    transactionVerificationExpectationFor(record),
+    deps.now(),
+  );
+  if (!evaluation.ok) {
+    return { ok: false, reason: "verification-required", record };
+  }
+  return { ok: true, record, verification: evaluation.record };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: customer-confirmed execution
+
+/**
+ * The exact values the protected replacement path is invoked with — all
+ * taken from the server-held intervention record, never from the browser.
+ */
+export interface InterventionReplacementPathRequest {
+  operationId: string;
+  confirmationId: string;
+  merchantId: string;
+  payerId: string;
+  sourceId: string;
+  subscriptionId: string;
+  /** YYYY-MM-DD: the approved new start date held on the intervention. */
+  proposedStartDate: string;
+  /** The exact three Pinch-preview payments held on the intervention. */
+  confirmedPayments: readonly ConfirmedSchedulePayment[];
+}
+
+/**
+ * The interpreted result of one protected-path invocation. "refused" means
+ * the path stopped before any mutation (original subscription untouched);
+ * "manual-recovery" means a failure after mutation began; "unknown" means
+ * the outcome could not be read — a mutation may have been issued, so it is
+ * treated exactly as conservatively as manual recovery and never
+ * resubmitted.
+ */
+export type InterventionReplacementPathResult =
+  | { kind: "verified"; newSubscriptionId: string }
+  | { kind: "manual-recovery"; stage: string; newSubscriptionId: string | null }
+  | { kind: "refused"; stage: string }
+  | { kind: "unknown" };
+
+export interface InterventionExecutionDeps {
+  repository: DueLogicInterventionRepository;
+  now(): string;
+  /** One-way hash of the raw intervention link token. */
+  hashToken(rawToken: string): string;
+  generateOperationId(): string;
+  /** Real confirmation-service deps from the route; fakes in validation. */
+  confirmationDeps: CustomerConfirmationServiceDeps;
+  /**
+   * Invokes the existing protected replacement path exactly once and
+   * interprets its response. The path performs its own fresh Pinch
+   * preflight, confirmation verification and consumption, recovery-record
+   * write, cancellation, creation and verification, and never retries a
+   * mutation. Implementations must not retry either.
+   */
+  executeReplacementPath(
+    request: InterventionReplacementPathRequest,
+  ): Promise<InterventionReplacementPathResult>;
+}
+
+export type ConfirmInterventionExecutionOutcome =
+  | { ok: true; record: DueLogicInterventionRecord }
+  | {
+      ok: false;
+      reason:
+        | "not-found"
+        | "expired"
+        | "declined"
+        | "escalated"
+        | "already-executing"
+        | "already-executed"
+        | "manual-recovery-required"
+        | "not-confirmable"
+        | "confirmation-failed"
+        | "refused"
+        | "store";
+      record?: DueLogicInterventionRecord;
+    };
+
+/**
+ * The single internal Stage 2 entry point: one customer confirmation
+ * executes the permanent replacement once. Transaction verification is a
+ * PREREQUISITE checked before this function is called — every
+ * customer-facing surface must first pass requireTransactionVerification;
+ * no OTP or verification logic lives inside this function, so the later
+ * OTP stage adds record creation without changing it.
+ *
+ * Exact ordering:
+ *  1. Reload the intervention by hashed token; require an unexpired
+ *     preview-ready record with an approved policy outcome, the exact three
+ *     stored Pinch-preview schedules, and no prior execution linkage — a
+ *     record already executing, executed or in manual recovery refuses.
+ *  1b. Write the "executing" latch with a fresh server-generated operation
+ *     ID (verified by read-back) so a second submission cannot execute.
+ *  2. Create the customer confirmation record bound to the stored merchant,
+ *     payer, source, subscription, plan, approved start date and the exact
+ *     three preview payments — server-held values only.
+ *  3. Record the customer's acceptance. The raw confirmation token is used
+ *     server-side exactly once here and is never stored, logged or
+ *     returned.
+ *  4. Invoke the existing protected replacement path unchanged, exactly
+ *     once.
+ *  5. Write confirmationId, operationId and newSubscriptionId back to the
+ *     intervention and set its status from the result: verified → executed;
+ *     failure after mutation began (or an unreadable outcome) →
+ *     manual-recovery-required; refused before any mutation → reverted to
+ *     preview-ready with the execution linkage cleared (nothing external
+ *     changed, so a fresh confirmation may be attempted later).
+ *  6. Return the outcome with the final record for the customer page.
+ */
+export async function confirmInterventionExecution(
+  input: { token: string },
+  deps: InterventionExecutionDeps,
+): Promise<ConfirmInterventionExecutionOutcome> {
+  // 1. Reload and gate.
+  const record = await deps.repository.readByTokenHash(
+    deps.hashToken(input.token.trim()),
+  );
+  if (record === null) {
+    return { ok: false, reason: "not-found" };
+  }
+  const nowIso = deps.now();
+  const status = effectiveInterventionStatus(record, nowIso);
+  if (status === "executing") {
+    return { ok: false, reason: "already-executing", record };
+  }
+  if (status === "executed") {
+    return { ok: false, reason: "already-executed", record };
+  }
+  if (status === "manual-recovery-required") {
+    return { ok: false, reason: "manual-recovery-required", record };
+  }
+  if (status === "expired" || status === "declined" || status === "escalated") {
+    return { ok: false, reason: status, record };
+  }
+  if (status !== "preview-ready") {
+    return { ok: false, reason: "not-confirmable", record };
+  }
+  if (
+    record.policyOutcome !== "approved" ||
+    record.selectedDate === null ||
+    record.currentPayments === null ||
+    record.currentPayments.length !== 3 ||
+    record.proposedPayments === null ||
+    record.proposedPayments.length !== 3 ||
+    record.proposedPayments[0].paymentDate !== record.selectedDate ||
+    record.confirmationId !== null ||
+    record.operationId !== null ||
+    record.newSubscriptionId !== null
+  ) {
+    return { ok: false, reason: "not-confirmable", record };
+  }
+
+  // 1b. Single-submission latch, before anything else happens.
+  const operationId = deps.generateOperationId();
+  const executing: DueLogicInterventionRecord = {
+    ...record,
+    status: "executing",
+    operationId,
+    updatedAt: nowIso,
+  };
+  if (!(await writeAndVerify(deps.repository, executing))) {
+    return { ok: false, reason: "store", record };
+  }
+
+  // Pre-execution failures revert the latch: nothing external has changed,
+  // so the record honestly returns to preview-ready with the execution
+  // linkage cleared. (Any created confirmation record remains in the
+  // confirmation store as audit history and simply expires unused.)
+  const revert = async (): Promise<DueLogicInterventionRecord> => {
+    const reverted: DueLogicInterventionRecord = {
+      ...executing,
+      status: "preview-ready",
+      confirmationId: null,
+      operationId: null,
+      updatedAt: deps.now(),
+    };
+    return (await writeAndVerify(deps.repository, reverted))
+      ? reverted
+      : executing;
+  };
+
+  // 2. The confirmation record, bound to the stored server-held values.
+  const created = await createCustomerConfirmation(
+    {
+      merchantId: record.merchantId,
+      payerId: record.payerId,
+      sourceId: record.sourceId,
+      subscriptionId: record.subscriptionId,
+      planId: record.planId,
+      currentStartDate: record.currentStartDate,
+      proposedStartDate: record.selectedDate,
+      currentPayments: record.currentPayments,
+      proposedPayments: record.proposedPayments,
+      currency: record.currency,
+    },
+    deps.confirmationDeps,
+  );
+  if (!created.ok) {
+    return { ok: false, reason: "confirmation-failed", record: await revert() };
+  }
+
+  // 3. Customer acceptance: the confirm click on the tokenised page is the
+  // acceptance being recorded. The raw confirmation token is used exactly
+  // once, server-side, and never leaves this function.
+  const accepted = await respondToCustomerConfirmation(
+    { token: created.rawToken, response: "accept" },
+    deps.confirmationDeps,
+  );
+  if (!accepted.ok) {
+    return { ok: false, reason: "confirmation-failed", record: await revert() };
+  }
+
+  const bound: DueLogicInterventionRecord = {
+    ...executing,
+    confirmationId: created.record.confirmationId,
+    updatedAt: deps.now(),
+  };
+  if (!(await writeAndVerify(deps.repository, bound))) {
+    return { ok: false, reason: "store", record: await revert() };
+  }
+
+  // 4. The one invocation of the existing protected replacement path. A
+  // thrown error means the outcome is unreadable — a mutation may have been
+  // issued — so it is treated as unknown and never retried.
+  let result: InterventionReplacementPathResult;
+  try {
+    result = await deps.executeReplacementPath({
+      operationId,
+      confirmationId: created.record.confirmationId,
+      merchantId: record.merchantId,
+      payerId: record.payerId,
+      sourceId: record.sourceId,
+      subscriptionId: record.subscriptionId,
+      proposedStartDate: record.selectedDate,
+      confirmedPayments: record.proposedPayments,
+    });
+  } catch {
+    result = { kind: "unknown" };
+  }
+
+  // 5. Result write-back. After the path has been invoked, a store failure
+  // must never flip the reported outcome or trigger any retry; the
+  // in-memory record is returned regardless.
+  if (result.kind === "verified") {
+    const executed: DueLogicInterventionRecord = {
+      ...bound,
+      status: "executed",
+      newSubscriptionId: result.newSubscriptionId,
+      updatedAt: deps.now(),
+    };
+    await writeAndVerify(deps.repository, executed);
+    return { ok: true, record: executed };
+  }
+  if (result.kind === "refused") {
+    // The path stopped before any mutation; the original subscription is
+    // untouched.
+    return { ok: false, reason: "refused", record: await revert() };
+  }
+  const failed: DueLogicInterventionRecord = {
+    ...bound,
+    status: "manual-recovery-required",
+    newSubscriptionId:
+      result.kind === "manual-recovery" ? result.newSubscriptionId : null,
+    updatedAt: deps.now(),
+  };
+  await writeAndVerify(deps.repository, failed);
+  return { ok: false, reason: "manual-recovery-required", record: failed };
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +1190,11 @@ export function generateInterventionId(): string {
 
 export function generateInterventionNotificationId(): string {
   return `ntf_${randomUUID()}`;
+}
+
+/** Server-generated replacement operation ID for one confirmed execution. */
+export function generateInterventionOperationId(): string {
+  return `duelogic-int-${randomUUID()}`;
 }
 
 export { DEV_INTERVENTION_INVITATION_LIFETIME_MINUTES };

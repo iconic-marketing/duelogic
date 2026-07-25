@@ -1,16 +1,18 @@
 /**
- * Deterministic validation of the Stage 1 customer-led intervention flow,
- * following the repository's validation convention: the exported async
- * function re-asserts the full scenario table on demand, and one pass is
- * kicked off at module load with loud failure logging.
+ * Deterministic validation of the customer-led intervention flow (Stage 1
+ * journey and Stage 2 customer-confirmed execution), following the
+ * repository's validation convention: the exported async function
+ * re-asserts the full scenario table on demand, and one pass is kicked off
+ * at module load with loud failure logging.
  *
  * Nothing here calls Pinch or reads a clock: repositories, clock, token
- * generator, token hasher and every subscription/preview read effect are
- * injected fakes over synthetic identifiers. No live merchant, payer,
- * subscription, plan or source IDs appear in the fixtures, and no real
- * token is ever created. The synthetic payment-history seed and the real
- * detector/policy engine are the same frozen deterministic inputs the
- * dashboard renders.
+ * generator, token hasher, every subscription/preview read effect and the
+ * replacement-path invoker are injected fakes over synthetic identifiers.
+ * The fake replacement path drives the REAL protected flow
+ * (executeSubscriptionReplacement) with fake Pinch effects, so the
+ * consumption ordering and no-retry contracts are exercised end to end
+ * with no network access. No live merchant, payer, subscription, plan or
+ * source IDs appear in the fixtures, and no real token is ever created.
  *
  * The eight Stage 1 scenarios:
  *  s1 scheduled scan creates one invitation for the designated opportunity;
@@ -23,8 +25,29 @@
  *  s6 an ambiguous active-subscription resolution creates no invitation;
  *  s7 decline prevents further preview and leaves confirmationId,
  *     operationId and newSubscriptionId null;
- *  s8 preview-ready leaves those fields null and exposes only a disabled
- *     final confirmation control.
+ *  s8 preview-ready keeps the exact schedules, leaves the Stage 2 fields
+ *     null, and the final confirmation stays disabled because no verified
+ *     transaction-verification record exists — derived, never hardcoded.
+ *
+ * The Stage 2 execution scenarios (s9-s14 call the internal
+ * confirmInterventionExecution directly with fakes — the verification gate
+ * is a prerequisite of the public surface, validated by s15, and is never
+ * bypassed through any route):
+ *  s9 one internal confirmation call executes the replacement exactly once
+ *     and records the verified linkage;
+ * s10 a second submission cannot execute — executed and in-flight records
+ *     both refuse without invoking the path;
+ * s11 a non-preview-ready invitation is blocked before any confirmation is
+ *     created;
+ * s12 an expired invitation is blocked before any confirmation is created;
+ * s13 a failure after cancellation sets manual-recovery-required and is
+ *     terminal — no resubmission, no decline;
+ * s14 the accepted confirmation is consumed exactly once, before
+ *     cancellation;
+ * s15 the route-level transaction-verification gate refuses execution when
+ *     no valid verified record exists: the internal function is never
+ *     called, and no confirmation, operation, execution state or
+ *     replacement dependency is touched.
  */
 
 import {
@@ -41,18 +64,39 @@ import {
 } from "./intervention";
 import type { InterventionDemoFixture } from "./intervention-fixture";
 import {
+  confirmInterventionExecution,
   declineIntervention,
   evaluateSelectedDate,
+  requireTransactionVerification,
   runScheduledInterventionScan,
+  type InterventionExecutionDeps,
   type InterventionPreviewReadEffects,
+  type InterventionReplacementPathRequest,
+  type InterventionReplacementPathResult,
   type InterventionScanDeps,
 } from "./intervention-service";
+import {
+  createEmptyDevTransactionVerificationRepository,
+  type TransactionVerificationRecord,
+} from "./transaction-verification";
 import { addCalendarDays } from "./calendar-date";
 import type {
   SubscriptionDetailSnapshot,
   SubscriptionReadEffects,
 } from "./subscription-resolver";
 import type { ConfirmedSchedulePayment } from "@/lib/pinch/customer-confirmation";
+import {
+  consumeAcceptedCustomerConfirmation,
+  evaluateConfirmationForReplacement,
+  type CustomerConfirmationServiceDeps,
+} from "@/lib/pinch/customer-confirmation-service";
+import { createInMemoryCustomerConfirmationRepository } from "@/lib/pinch/dev-customer-confirmation-store";
+import { createInMemoryReplacementOperationRepository } from "@/lib/pinch/dev-replacement-operation-store";
+import type { SubscriptionReplacementRecoverySnapshot } from "@/lib/pinch/replacement-operation";
+import {
+  executeSubscriptionReplacement,
+  type ReplacementExecutionEffects,
+} from "@/lib/pinch/replacement-operation-flow";
 
 export interface InterventionValidationRow {
   scenario: string;
@@ -262,6 +306,255 @@ async function scanCreated(
     `scan must create an invitation (got ${outcome.outcome})`,
   );
   return (outcome as { record: DueLogicInterventionRecord }).record;
+}
+
+/** Scan plus an approved suggested-date evaluation: a preview-ready record. */
+async function toPreviewReady(
+  harness: Harness,
+): Promise<DueLogicInterventionRecord> {
+  const created = await scanCreated(harness);
+  const preview = makePreviewReads(demoSubscription());
+  const outcome = await evaluateSelectedDate(
+    { token: FIRST_RAW_TOKEN, selectedDate: created.suggestedDate },
+    DEMO_FIXTURE,
+    {
+      repository: harness.repository,
+      now: harness.clock.now,
+      hashToken: harness.tokenDeps.hashToken,
+      previewReads: preview.effects,
+    },
+  );
+  check(
+    outcome.ok && outcome.record.status === "preview-ready",
+    "execution fixture: the suggested date must reach preview-ready",
+  );
+  return (outcome as { record: DueLogicInterventionRecord }).record;
+}
+
+/**
+ * A synthetic verified transaction verification bound exactly to the
+ * supplied intervention record — what the future OTP stage would create.
+ * Used to prove the gate and finalConfirmationEnabled derive from the
+ * record rather than being hardcoded. Never persisted anywhere.
+ */
+function fakeVerifiedTransactionVerification(
+  interventionRecord: DueLogicInterventionRecord,
+  nowIso: string,
+): TransactionVerificationRecord {
+  return {
+    verificationId: "ver_demo_01",
+    interventionId: interventionRecord.interventionId,
+    merchantId: interventionRecord.merchantId,
+    payerId: interventionRecord.payerId,
+    subscriptionId: interventionRecord.subscriptionId,
+    selectedDate: interventionRecord.selectedDate ?? "",
+    currentPayments: (interventionRecord.currentPayments ?? []).map(
+      (payment) => ({ ...payment }),
+    ),
+    proposedPayments: (interventionRecord.proposedPayments ?? []).map(
+      (payment) => ({ ...payment }),
+    ),
+    policyVersion: interventionRecord.policyVersion,
+    verifiedAt: nowIso,
+    expiresAt: new Date(Date.parse(nowIso) + 10 * 60_000).toISOString(),
+    consumedAt: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 execution harness: injected fakes only. The fake replacement
+// path mimics the protected route's composition — the confirmation gate,
+// then the REAL executeSubscriptionReplacement driven by fake Pinch
+// effects — so consumption ordering and the no-retry contract are
+// exercised end to end without any network access.
+
+interface ExecutionHarness {
+  deps: InterventionExecutionDeps;
+  confirmationRepository: ReturnType<
+    typeof createInMemoryCustomerConfirmationRepository
+  >;
+  /** Ordered effect log across every path invocation. */
+  pathCalls: string[];
+  confirmationsCreated(): number;
+  operationsStarted(): number;
+}
+
+function makeExecutionHarness(
+  harness: Harness,
+  behaviour: { createFails?: boolean } = {},
+): ExecutionHarness {
+  const confirmationRepository = createInMemoryCustomerConfirmationRepository();
+  let confirmationCounter = 0;
+  let confirmationTokenCounter = 0;
+  const confirmationDeps: CustomerConfirmationServiceDeps = {
+    repository: confirmationRepository,
+    now: harness.clock.now,
+    generateConfirmationId: (): string => {
+      confirmationCounter += 1;
+      return `conf_demo_${String(confirmationCounter).padStart(2, "0")}`;
+    },
+    generateToken: (): string => {
+      confirmationTokenCounter += 1;
+      return `raw-demo-confirmation-${String(confirmationTokenCounter).padStart(2, "0")}`;
+    },
+    hashToken: (raw: string): string =>
+      `fakehash:${raw.split("").reverse().join("")}`,
+    lifetimeMinutes: 30,
+  };
+
+  const operationRepository = createInMemoryReplacementOperationRepository();
+  const pathCalls: string[] = [];
+  let subscriptionStatus = "active";
+
+  const executeReplacementPath = async (
+    request: InterventionReplacementPathRequest,
+  ): Promise<InterventionReplacementPathResult> => {
+    pathCalls.push(`execute:${request.operationId}`);
+
+    // The protected route's own confirmation gate, with unchanged
+    // semantics: accepted, unexpired, unused and bound to this exact
+    // replacement.
+    const confirmationRecord = await confirmationRepository.readById(
+      request.confirmationId,
+    );
+    const evaluation = evaluateConfirmationForReplacement(
+      confirmationRecord,
+      {
+        merchantId: request.merchantId,
+        payerId: request.payerId,
+        sourceId: request.sourceId,
+        subscriptionId: request.subscriptionId,
+        proposedStartDate: request.proposedStartDate,
+        confirmedPayments: request.confirmedPayments,
+      },
+      harness.clock.now(),
+    );
+    if (!evaluation.ok) {
+      return { kind: "refused", stage: `confirmation-${evaluation.reason}` };
+    }
+
+    const effects: ReplacementExecutionEffects = {
+      consumeCustomerConfirmation: async () => {
+        pathCalls.push("consume-confirmation");
+        return consumeAcceptedCustomerConfirmation(
+          {
+            confirmationId: request.confirmationId,
+            operationId: request.operationId,
+          },
+          { repository: confirmationRepository, now: harness.clock.now },
+        );
+      },
+      cancelOriginal: async () => {
+        pathCalls.push("cancel-original");
+        subscriptionStatus = "cancelled";
+      },
+      readOriginalStatus: async () => {
+        pathCalls.push("verify-cancellation");
+        return { id: request.subscriptionId, status: subscriptionStatus };
+      },
+      createReplacement: async () => {
+        pathCalls.push("create-replacement");
+        if (behaviour.createFails === true) {
+          throw new Error("SimulatedCreateFailure");
+        }
+        return { id: "sub_demo_replacement" };
+      },
+      verifyReplacement: async (newSubscriptionId) => {
+        pathCalls.push("verify-replacement");
+        return {
+          oldSubscriptionId: request.subscriptionId,
+          newSubscriptionId,
+          verifiedStartDate: request.proposedStartDate,
+          planId: "pln_demo",
+          payerId: request.payerId,
+          paymentDates: request.confirmedPayments.map(
+            (payment) => payment.paymentDate,
+          ),
+          paymentAmountsCents: request.confirmedPayments.map(
+            (payment) => payment.amountInCents,
+          ),
+        };
+      },
+    };
+
+    const recoverySnapshot: SubscriptionReplacementRecoverySnapshot = {
+      merchantId: request.merchantId,
+      payerId: request.payerId,
+      sourceId: request.sourceId,
+      planId: "pln_demo",
+      originalStartDate: "2026-08-14",
+      oldSubscriptionId: request.subscriptionId,
+      reinstatementCreateBody: {
+        planId: "pln_demo",
+        payerId: request.payerId,
+        sourceId: request.sourceId,
+        startDate: "2026-08-14",
+      },
+      originalCalculatedPayments: threePaymentsFrom("2026-08-14").map(
+        (payment) => ({
+          transactionDate: payment.paymentDate,
+          amountCents: payment.amountInCents,
+        }),
+      ),
+    };
+
+    const result = await executeSubscriptionReplacement(
+      {
+        operationId: request.operationId,
+        confirmationId: request.confirmationId,
+        merchantId: request.merchantId,
+        payerId: request.payerId,
+        planId: "pln_demo",
+        sourceId: request.sourceId,
+        oldSubscriptionId: request.subscriptionId,
+        previousStartDate: "2026-08-14",
+        requestedStartDate: request.proposedStartDate,
+        previousTotalAmountCents: null,
+        requestedTotalAmountCents: null,
+        recoverySnapshot,
+      },
+      operationRepository,
+      effects,
+      harness.clock.now,
+      () => {},
+    );
+    if (result.outcome === "replacement-verified") {
+      return {
+        kind: "verified",
+        newSubscriptionId: result.record.newSubscriptionId as string,
+      };
+    }
+    if (
+      result.outcome === "confirmation-consumption-failed" ||
+      result.outcome === "recovery-record-failed"
+    ) {
+      return { kind: "refused", stage: result.outcome };
+    }
+    return {
+      kind: "manual-recovery",
+      stage: result.outcome,
+      newSubscriptionId: result.record.newSubscriptionId,
+    };
+  };
+
+  let operationCounter = 0;
+  return {
+    deps: {
+      repository: harness.repository,
+      now: harness.clock.now,
+      hashToken: harness.tokenDeps.hashToken,
+      generateOperationId: (): string => {
+        operationCounter += 1;
+        return `op_demo_${String(operationCounter).padStart(2, "0")}`;
+      },
+      confirmationDeps,
+      executeReplacementPath,
+    },
+    confirmationRepository,
+    pathCalls,
+    confirmationsCreated: () => confirmationCounter,
+    operationsStarted: () => operationCounter,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -590,10 +883,13 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
     record("s7-decline-prevents-preview", "declined");
   }
 
-  // s8: preview-ready leaves confirmationId, operationId and
-  // newSubscriptionId null, and the customer projection exposes only a
-  // disabled final confirmation control and no internal identifiers; the
-  // merchant projection carries no token material.
+  // s8: preview-ready remains valid with the exact Pinch-preview schedules
+  // present and the Stage 2 identifiers null; the customer's final
+  // confirmation control stays disabled because no verified
+  // transaction-verification record exists — the false is derived from the
+  // missing record (a bound verified record would enable it), never
+  // hardcoded — and no internal identifiers or token material leak from
+  // either projection.
   {
     const harness = makeHarness();
     const created = await scanCreated(harness);
@@ -621,13 +917,44 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
         stored.newSubscriptionId === null,
       "s8: preview-ready must leave the Stage 2 fields null",
     );
+    check(
+      stored !== null &&
+        stored.currentPayments !== null &&
+        stored.currentPayments.length === 3 &&
+        stored.proposedPayments !== null &&
+        stored.proposedPayments.length === 3,
+      "s8: the exact Pinch-preview schedules must remain present",
+    );
     const customerView = toCustomerInterventionProjection(
       stored as DueLogicInterventionRecord,
       harness.clock.now(),
     );
     check(
       customerView.finalConfirmationEnabled === false,
-      "s8: the customer projection must keep the final confirmation disabled",
+      "s8: the confirmation button must stay disabled — no verified transaction-verification record exists",
+    );
+    // Not hardcoded: the identical record with a bound verified
+    // transaction verification would enable the control, and a consumed
+    // one would not.
+    const boundVerification = fakeVerifiedTransactionVerification(
+      stored as DueLogicInterventionRecord,
+      harness.clock.now(),
+    );
+    check(
+      toCustomerInterventionProjection(
+        stored as DueLogicInterventionRecord,
+        harness.clock.now(),
+        boundVerification,
+      ).finalConfirmationEnabled === true,
+      "s8: a bound verified record must enable the control — the false derives from the missing record",
+    );
+    check(
+      toCustomerInterventionProjection(
+        stored as DueLogicInterventionRecord,
+        harness.clock.now(),
+        { ...boundVerification, consumedAt: harness.clock.now() },
+      ).finalConfirmationEnabled === false,
+      "s8: a consumed verification must not enable the control",
     );
     const customerJson = JSON.stringify(customerView);
     check(
@@ -652,6 +979,347 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       "s8: the merchant projection must expose no token material or customer link",
     );
     record("s8-preview-ready-stage2-seam-disabled", "seam-intact");
+  }
+
+  // s9: one valid internal confirmInterventionExecution call executes the
+  // replacement exactly once and records the verified linkage on the
+  // intervention, the confirmation and the operation record.
+  {
+    const harness = makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const outcome = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(outcome.ok, "s9: the internal confirmation call must execute");
+    const executedRecord = outcome.ok ? outcome.record : null;
+    check(
+      executedRecord !== null &&
+        executedRecord.status === "executed" &&
+        executedRecord.newSubscriptionId === "sub_demo_replacement" &&
+        executedRecord.confirmationId === "conf_demo_01" &&
+        executedRecord.operationId === "op_demo_01",
+      "s9: the executed record must carry the verified linkage",
+    );
+    const stored = await harness.repository.readById(
+      (executedRecord as DueLogicInterventionRecord).interventionId,
+    );
+    check(
+      stored !== null &&
+        stored.status === "executed" &&
+        stored.newSubscriptionId === "sub_demo_replacement",
+      "s9: the executed state must be persisted",
+    );
+    const confirmation =
+      await execution.confirmationRepository.readById("conf_demo_01");
+    check(
+      confirmation !== null &&
+        confirmation.status === "consumed" &&
+        confirmation.acceptedAt !== null &&
+        confirmation.operationId === "op_demo_01",
+      "s9: the confirmation must be accepted then consumed by this operation",
+    );
+    check(
+      execution.pathCalls.filter((call) => call.startsWith("execute:"))
+        .length === 1 &&
+        execution.pathCalls.filter((call) => call === "cancel-original")
+          .length === 1 &&
+        execution.pathCalls.filter((call) => call === "create-replacement")
+          .length === 1 &&
+        execution.pathCalls.includes("verify-replacement"),
+      "s9: the protected path must run exactly once through verification",
+    );
+    check(
+      toCustomerInterventionProjection(
+        stored as DueLogicInterventionRecord,
+        harness.clock.now(),
+      ).finalConfirmationEnabled === false,
+      "s9: an executed record must never offer confirmation again",
+    );
+    record("s9-confirm-executes-once", "executed");
+  }
+
+  // s10: a second submission cannot execute — an already-executed record
+  // and an in-flight "executing" latch both refuse without invoking the
+  // path or creating another confirmation.
+  {
+    const harness = makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const first = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(first.ok, "s10: the first submission must execute");
+    const callsAfterFirst = execution.pathCalls.length;
+    const second = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !second.ok && second.reason === "already-executed",
+      "s10: a second submission must refuse",
+    );
+    check(
+      execution.pathCalls.length === callsAfterFirst &&
+        execution.confirmationsCreated() === 1 &&
+        execution.operationsStarted() === 1,
+      "s10: the second submission must not invoke the path or create anything",
+    );
+
+    // An in-flight latch refuses too: a fresh preview-ready record written
+    // to "executing" simulates a concurrent submission mid-execution.
+    const latchHarness = makeHarness();
+    const previewRecord = await toPreviewReady(latchHarness);
+    await latchHarness.repository.write({
+      ...previewRecord,
+      status: "executing",
+      operationId: "op_demo_latch",
+    });
+    const latchExecution = makeExecutionHarness(latchHarness);
+    const during = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      latchExecution.deps,
+    );
+    check(
+      !during.ok &&
+        during.reason === "already-executing" &&
+        latchExecution.pathCalls.length === 0 &&
+        latchExecution.confirmationsCreated() === 0,
+      "s10: an in-flight execution must refuse without any side effect",
+    );
+    record("s10-second-submission-cannot-execute", "blocked");
+  }
+
+  // s11: a non-preview-ready intervention is blocked before any
+  // confirmation is created — both a pre-selection state and a declined
+  // record refuse.
+  {
+    const harness = makeHarness();
+    await scanCreated(harness);
+    const execution = makeExecutionHarness(harness);
+    const outcome = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !outcome.ok && outcome.reason === "not-confirmable",
+      "s11: a pre-selection invitation must be blocked",
+    );
+    check(
+      execution.pathCalls.length === 0 &&
+        execution.confirmationsCreated() === 0 &&
+        execution.operationsStarted() === 0,
+      "s11: the blocked call must create nothing and invoke nothing",
+    );
+    const declined = await declineIntervention(
+      { token: FIRST_RAW_TOKEN },
+      {
+        repository: harness.repository,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+      },
+    );
+    check(declined.ok, "s11: the decline fixture must apply");
+    const afterDecline = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !afterDecline.ok && afterDecline.reason === "declined",
+      "s11: a declined invitation must be blocked",
+    );
+    record("s11-non-preview-ready-blocked", "blocked");
+  }
+
+  // s12: an expired invitation is blocked before any confirmation is
+  // created, and its stored state is untouched.
+  {
+    const harness = makeHarness();
+    const previewRecord = await toPreviewReady(harness);
+    harness.clock.advanceMinutes(31);
+    const execution = makeExecutionHarness(harness);
+    const outcome = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !outcome.ok && outcome.reason === "expired",
+      "s12: an expired invitation must be blocked",
+    );
+    check(
+      execution.pathCalls.length === 0 &&
+        execution.confirmationsCreated() === 0 &&
+        execution.operationsStarted() === 0,
+      "s12: the expired refusal must create nothing and invoke nothing",
+    );
+    const stored = await harness.repository.readById(
+      previewRecord.interventionId,
+    );
+    check(
+      stored !== null &&
+        stored.confirmationId === null &&
+        stored.operationId === null &&
+        stored.newSubscriptionId === null,
+      "s12: the expired invitation must keep its execution fields null",
+    );
+    record("s12-expired-blocked", "blocked");
+  }
+
+  // s13: a simulated failure after cancellation produces
+  // manual-recovery-required, which is terminal: no resubmission and no
+  // decline can follow, and the consumed confirmation stays consumed.
+  {
+    const harness = makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness, { createFails: true });
+    const outcome = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !outcome.ok && outcome.reason === "manual-recovery-required",
+      "s13: a post-cancellation failure must report manual recovery",
+    );
+    const failedRecord = outcome.ok ? null : (outcome.record ?? null);
+    check(
+      failedRecord !== null &&
+        failedRecord.status === "manual-recovery-required" &&
+        failedRecord.confirmationId === "conf_demo_01" &&
+        failedRecord.operationId === "op_demo_01" &&
+        failedRecord.newSubscriptionId === null,
+      "s13: the failure must keep the linkage with no replacement ID",
+    );
+    check(
+      execution.pathCalls.includes("cancel-original") &&
+        execution.pathCalls.includes("create-replacement") &&
+        !execution.pathCalls.includes("verify-replacement"),
+      "s13: the failure must occur after cancellation, before verification",
+    );
+    const confirmation =
+      await execution.confirmationRepository.readById("conf_demo_01");
+    check(
+      confirmation !== null && confirmation.status === "consumed",
+      "s13: the consumed confirmation must stay consumed",
+    );
+    const callsAfterFailure = execution.pathCalls.length;
+    const repeat = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !repeat.ok &&
+        repeat.reason === "manual-recovery-required" &&
+        execution.pathCalls.length === callsAfterFailure,
+      "s13: manual recovery is terminal — no resubmission may execute",
+    );
+    const decline = await declineIntervention(
+      { token: FIRST_RAW_TOKEN },
+      {
+        repository: harness.repository,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+      },
+    );
+    check(
+      !decline.ok && decline.reason === "manual-recovery-required",
+      "s13: a decline after execution began must be refused",
+    );
+    record("s13-post-cancellation-failure", "manual-recovery-required");
+  }
+
+  // s14: the accepted confirmation is consumed exactly once, strictly
+  // before the cancellation step — the write-before-cancel contract seen
+  // from the intervention side.
+  {
+    const harness = makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const outcome = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(outcome.ok, "s14: the confirmation must execute");
+    const consumeIndex = execution.pathCalls.indexOf("consume-confirmation");
+    const cancelIndex = execution.pathCalls.indexOf("cancel-original");
+    check(
+      consumeIndex !== -1 && cancelIndex !== -1 && consumeIndex < cancelIndex,
+      "s14: the confirmation must be consumed before cancellation",
+    );
+    check(
+      execution.pathCalls.filter((call) => call === "consume-confirmation")
+        .length === 1,
+      "s14: consumption must happen exactly once",
+    );
+    record("s14-consumption-before-cancellation", "ordered");
+  }
+
+  // s15: the route-level transaction-verification gate refuses execution
+  // when no valid verified record exists — the exact composition the dev
+  // confirmation route uses: requireTransactionVerification first, and
+  // confirmInterventionExecution only on a passing gate. The empty
+  // development repository is the only implementation in the application
+  // (no write path exists anywhere), so token possession alone can never
+  // reach the internal function.
+  {
+    const harness = makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const before = JSON.stringify(await harness.repository.list());
+    const gate = await requireTransactionVerification(
+      { token: FIRST_RAW_TOKEN },
+      {
+        repository: harness.repository,
+        verifications: createEmptyDevTransactionVerificationRepository(),
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+      },
+    );
+    check(
+      !gate.ok && gate.reason === "verification-required",
+      "s15: the gate must refuse without a verified record",
+    );
+    // The route calls confirmInterventionExecution only when the gate
+    // passes, so a refusal means the internal function was never called:
+    // no confirmation, no operation, no path invocation and no execution
+    // state may exist.
+    check(
+      execution.pathCalls.length === 0 &&
+        execution.confirmationsCreated() === 0 &&
+        execution.operationsStarted() === 0,
+      "s15: the refusal must invoke no execution dependency",
+    );
+    check(
+      JSON.stringify(await harness.repository.list()) === before,
+      "s15: the refusal must write no intervention execution state",
+    );
+    // Counter-proof: a verified record bound to this exact intervention
+    // opens the gate, so the refusal derives from the missing record and
+    // the later OTP stage only has to create records.
+    const storedRecords = await harness.repository.list();
+    const boundVerification = fakeVerifiedTransactionVerification(
+      storedRecords[0],
+      harness.clock.now(),
+    );
+    const wouldPass = await requireTransactionVerification(
+      { token: FIRST_RAW_TOKEN },
+      {
+        repository: harness.repository,
+        verifications: {
+          async readVerifiedForIntervention() {
+            return boundVerification;
+          },
+        },
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+      },
+    );
+    check(
+      wouldPass.ok,
+      "s15: a bound verified record must open the gate — the refusal is not hardcoded",
+    );
+    record("s15-gate-refuses-without-verification", "verification-required");
   }
 
   return { scenarioCount: table.length, decisionTable: table };

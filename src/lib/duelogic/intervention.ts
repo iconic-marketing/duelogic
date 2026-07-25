@@ -1,11 +1,12 @@
 /**
- * Types and pure helpers for the Stage 1 customer-led intervention record:
- * the server-held state of one automatically generated schedule-review
+ * Types and pure helpers for the customer-led intervention record: the
+ * server-held state of one automatically generated schedule-review
  * invitation, from the scheduled scan through customer date selection,
- * deterministic policy evaluation and the exact read-only Pinch schedule
- * preview. Stage 1 stops at preview-ready; confirmationId, operationId and
- * newSubscriptionId exist now so Stage 2 can fill them without redesigning
- * the record, and remain null throughout Stage 1.
+ * deterministic policy evaluation, the exact read-only Pinch schedule
+ * preview, and (Stage 2) customer-confirmed execution through the existing
+ * protected replacement path. confirmationId, operationId and
+ * newSubscriptionId remain null until the customer's final confirmation
+ * initiates execution.
  *
  * Pure data and functions only — no Pinch calls, no clock reads, no storage
  * and no token generation (the service injects those). The repository
@@ -17,6 +18,11 @@
 
 import type { PolicyWarning } from "./policy/engine";
 import type { SupportedScheduleCadence } from "./schema";
+import {
+  evaluateTransactionVerification,
+  type TransactionVerificationExpectation,
+  type TransactionVerificationRecord,
+} from "./transaction-verification";
 import type { ConfirmedSchedulePayment } from "@/lib/pinch/customer-confirmation";
 
 /**
@@ -33,6 +39,14 @@ export const INTERVENTION_EVENT_STATUSES = [
   "escalated",
   "preview-ready",
   "declined",
+  // Stage 2 execution states. "executing" is the single-submission latch
+  // written before the protected replacement path is invoked; "executed"
+  // records a verified replacement; "manual-recovery-required" records a
+  // failure after mutation began (or an unknowable outcome) — never
+  // resubmittable, merchant review only.
+  "executing",
+  "executed",
+  "manual-recovery-required",
 ] as const;
 
 export type InterventionEventStatus =
@@ -92,7 +106,11 @@ export interface DueLogicInterventionRecord {
   proposedPayments: readonly ConfirmedSchedulePayment[] | null;
   /** AUD for the current demonstration. */
   currency: "AUD";
-  /** Stage 2 seam — all three remain null throughout Stage 1. */
+  /**
+   * Stage 2 execution linkage: null until the customer's final
+   * confirmation initiates execution. IDs only — never token material and
+   * never the confirmation or operation record itself.
+   */
   confirmationId: string | null;
   operationId: string | null;
   newSubscriptionId: string | null;
@@ -170,12 +188,14 @@ export function findForbiddenInterventionRecordKey(
 }
 
 /**
- * The externally reported status: declined and escalated are terminal
- * historical facts and survive expiry; otherwise a record past its
- * expiresAt is expired regardless of its stored status. Expiry is always
- * evaluated here, server-side, against the supplied clock value — client
- * time is never authoritative. An unparseable expiry refuses use by
- * reporting expired.
+ * The externally reported status: declined, escalated, executed and
+ * manual-recovery-required are terminal historical facts and survive
+ * expiry, and an in-flight execution ("executing") is likewise reported
+ * as-is — an invitation that lapses mid-execution must never be masked as
+ * expired. Otherwise a record past its expiresAt is expired regardless of
+ * its stored status. Expiry is always evaluated here, server-side, against
+ * the supplied clock value — client time is never authoritative. An
+ * unparseable expiry refuses use by reporting expired.
  */
 export function effectiveInterventionStatus(
   record: DueLogicInterventionRecord,
@@ -186,6 +206,13 @@ export function effectiveInterventionStatus(
   }
   if (record.status === "escalated") {
     return "escalated";
+  }
+  if (
+    record.status === "executing" ||
+    record.status === "executed" ||
+    record.status === "manual-recovery-required"
+  ) {
+    return record.status;
   }
   const now = Date.parse(nowIso);
   const expires = Date.parse(record.expiresAt);
@@ -222,16 +249,52 @@ export interface CustomerInterventionProjection {
   proposedPayments: readonly ConfirmedSchedulePayment[] | null;
   currency: "AUD";
   expiresAt: string;
-  /** Always false in Stage 1: the final confirmation control stays disabled. */
-  finalConfirmationEnabled: false;
+  /**
+   * True only for an unexpired, policy-approved preview-ready invitation
+   * with the exact Pinch schedules stored AND a valid verified
+   * transaction-verification record bound to this exact intervention and
+   * schedule (CLAUDE.md "Customer transaction verification"). Evaluated
+   * server-side; the client never decides this. No write path for
+   * verification records exists yet, so this is currently always false —
+   * derived from the missing record, never hardcoded.
+   */
+  finalConfirmationEnabled: boolean;
+}
+
+/**
+ * The exact server-held binding a transaction verification must match for
+ * this intervention. Null schedule or date fields become empty values,
+ * which no verification record can match — an incomplete intervention can
+ * never be verified.
+ */
+export function transactionVerificationExpectationFor(
+  record: DueLogicInterventionRecord,
+): TransactionVerificationExpectation {
+  return {
+    interventionId: record.interventionId,
+    merchantId: record.merchantId,
+    payerId: record.payerId,
+    subscriptionId: record.subscriptionId,
+    selectedDate: record.selectedDate ?? "",
+    currentPayments: record.currentPayments ?? [],
+    proposedPayments: record.proposedPayments ?? [],
+    policyVersion: record.policyVersion,
+  };
 }
 
 export function toCustomerInterventionProjection(
   record: DueLogicInterventionRecord,
   nowIso: string,
+  verification: TransactionVerificationRecord | null = null,
 ): CustomerInterventionProjection {
+  const status = effectiveInterventionStatus(record, nowIso);
+  const verificationUsable = evaluateTransactionVerification(
+    verification,
+    transactionVerificationExpectationFor(record),
+    nowIso,
+  ).ok;
   return {
-    status: effectiveInterventionStatus(record, nowIso),
+    status,
     amountInCents: record.currentPaymentAmountInCents,
     currentScheduledDate: record.currentStartDate,
     scheduleCadence: record.scheduleCadence,
@@ -255,7 +318,12 @@ export function toCustomerInterventionProjection(
         : record.proposedPayments.map((payment) => ({ ...payment })),
     currency: record.currency,
     expiresAt: record.expiresAt,
-    finalConfirmationEnabled: false,
+    finalConfirmationEnabled:
+      status === "preview-ready" &&
+      record.policyOutcome === "approved" &&
+      record.currentPayments !== null &&
+      record.proposedPayments !== null &&
+      verificationUsable,
   };
 }
 
@@ -315,6 +383,10 @@ export interface InterventionMonitoringSummary {
   declined: number;
   escalated: number;
   expired: number;
+  /** Verified customer-confirmed executions. */
+  executed: number;
+  /** Executions needing merchant attention (including any still in flight). */
+  manualRecoveryRequired: number;
 }
 
 export function summariseInterventions(
@@ -328,6 +400,8 @@ export function summariseInterventions(
     declined: 0,
     escalated: 0,
     expired: 0,
+    executed: 0,
+    manualRecoveryRequired: 0,
   };
   for (const record of records) {
     const status = effectiveInterventionStatus(record, nowIso);
@@ -339,6 +413,14 @@ export function summariseInterventions(
       summary.escalated += 1;
     } else if (status === "expired") {
       summary.expired += 1;
+    } else if (status === "executed") {
+      summary.executed += 1;
+    } else if (status === "manual-recovery-required" || status === "executing") {
+      // An in-flight execution normally resolves within seconds; one that
+      // persists on a monitoring read needs the same merchant attention as
+      // a recorded failure, and neither is ever resubmittable. Counting
+      // conservatively never under-reports risk.
+      summary.manualRecoveryRequired += 1;
     } else {
       // invitation-created, opened, awaiting-date-selection,
       // alternative-offered and date-approved all still await a usable
