@@ -61,6 +61,8 @@ import type {
   MerchantPolicyRepository,
   MerchantPolicySnapshot,
 } from "./policy/policy-snapshot";
+import { toPriorScheduleChanges } from "./prior-change-history";
+import type { PriorScheduleChange } from "./schema";
 import { buildSeedPolicyEvaluations } from "./seed-policy-evaluations";
 import {
   resolveActiveSubscription,
@@ -199,6 +201,16 @@ export type ScheduledScanOutcome =
       notification: InterventionCustomerNotification;
     }
   | { outcome: "already-active"; record: DueLogicInterventionRecord }
+  | {
+      outcome: "policy-review-required";
+      /**
+       * Merchant-safe vocabulary only — never intervention records, policy
+       * JSON or reason internals. The decision came from the policy engine
+       * under the active saved policy and the payer's derived history.
+       */
+      reason: "permanent-change-limit-reached";
+      detail: string;
+    }
   | {
       outcome: "fixture-error";
       /** Safe stage vocabulary only — never response content. */
@@ -397,9 +409,14 @@ export async function runScheduledInterventionScan(
     };
   }
 
-  // 9 (before creation). Duplicate prevention: one active invitation per
-  // subscription. Only an expired invitation may be replaced; repeated scan
-  // clicks return the existing invitation unchanged.
+  // 6b. Verified prior-change history and the candidate policy decision.
+  // History is derived from the trusted intervention records and keyed by
+  // the payer — a verified correction on a since-replaced (cancelled)
+  // subscription still counts, so a new subscription ID can never reset the
+  // rolling allowance. The engine is the sole authority for rolling-window
+  // counting and escalation: the scan never counts uses or compares dates
+  // against the rolling period itself. The listed records also serve the
+  // duplicate-prevention check below.
   let existingRecords: DueLogicInterventionRecord[];
   try {
     existingRecords = await deps.repository.list();
@@ -409,6 +426,68 @@ export async function runScheduledInterventionScan(
       detail: "The intervention store could not be listed.",
     };
   }
+  const priorChanges = toPriorScheduleChanges(
+    existingRecords,
+    fixture.payerId,
+    fixture.merchantTimezone,
+  );
+  let candidateDecision;
+  try {
+    // The same trusted request construction customer date evaluation uses:
+    // merchant-held identity, amount, cadence and cycle metadata, with the
+    // detector-derived suggested date as the candidate anchor.
+    candidateDecision = evaluateScheduleChange(
+      {
+        changeType: "permanent",
+        payerId: fixture.payerId,
+        paymentId: `${subscription.id}-first-payment`,
+        amountCents: fixture.expectedRecurringAmountCents,
+        evaluationDate: scanDate,
+        currentArrearsCents: fixture.currentArrearsCents,
+        scheduleCadence: cycle.scheduleCadence,
+        effectiveCycle: "current-and-future",
+        previousPaymentDate: fixture.demonstrationPreviousSettledDebitDate,
+        currentPaymentDate: subscription.startDate,
+        nextPaymentDate,
+        currentCycleStartDate: cycle.currentCycleStartDate,
+        currentCycleEndDate: cycle.currentCycleEndDate,
+        nextCycleStartDate: cycle.nextCycleStartDate,
+        nextCycleEndDate: cycle.nextCycleEndDate,
+        requestedAnchorDate: suggestedDate,
+      },
+      priorChanges,
+      scanPolicy,
+    );
+  } catch (error) {
+    if (error instanceof PolicyValidationError) {
+      return {
+        outcome: "fixture-error",
+        reason: "unsuitable-for-invitation",
+        detail: `Candidate policy evaluation failed with ${error.code}.`,
+      };
+    }
+    throw error;
+  }
+  if (
+    candidateDecision.outcome === "escalate" &&
+    candidateDecision.reasonCode === "PERMANENT_CHANGE_LIMIT_REACHED"
+  ) {
+    // The payer's automatic permanent allowance is exhausted: merchant
+    // review is required, and no routine invitation, token, notification
+    // or preview may be produced. Every other policy outcome preserves the
+    // existing invitation behaviour — the customer's own date selection is
+    // still evaluated under the intervention-bound snapshot.
+    return {
+      outcome: "policy-review-required",
+      reason: "permanent-change-limit-reached",
+      detail:
+        "The rolling permanent-change allowance for this customer is exhausted; the opportunity requires merchant review.",
+    };
+  }
+
+  // 9 (before creation). Duplicate prevention: one active invitation per
+  // subscription. Only an expired invitation may be replaced; repeated scan
+  // clicks return the existing invitation unchanged.
   const active = existingRecords.find(
     (record) =>
       record.subscriptionId === subscription.id &&
@@ -720,12 +799,27 @@ export async function evaluateSelectedDate(
     requestedAnchorDate: selectedDate,
   };
 
+  // Verified prior-change history for this payer, derived from the trusted
+  // server-held intervention records — an executed correction on a
+  // since-replaced subscription still counts because history follows the
+  // payer, never the subscription ID. The engine (under the
+  // intervention-bound snapshot resolved above) remains the sole authority
+  // for rolling-window counting; an exhausted permanent allowance escalates
+  // here, before any Pinch preview read.
+  let priorChanges: readonly PriorScheduleChange[];
+  try {
+    priorChanges = toPriorScheduleChanges(
+      await deps.repository.list(),
+      record.payerId,
+      fixture.merchantTimezone,
+    );
+  } catch {
+    return { ok: false, reason: "store", record };
+  }
+
   let decision;
   try {
-    // No executed-verified prior schedule changes exist for the
-    // demonstration payer; the empty history is explicit, not inferred.
-    // The policy is the intervention-bound snapshot resolved above.
-    decision = evaluateScheduleChange(request, [], boundSnapshot.policy);
+    decision = evaluateScheduleChange(request, priorChanges, boundSnapshot.policy);
   } catch (error) {
     if (error instanceof PolicyValidationError) {
       // e.g. the selected date equals the current payment date. Customer

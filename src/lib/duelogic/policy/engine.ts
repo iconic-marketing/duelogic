@@ -680,10 +680,14 @@ function assertValidHistory(history: readonly PriorScheduleChange[]): void {
 }
 
 /**
- * Rolling window [evaluationDate minus rollingPeriodMonths, evaluationDate):
- * inclusive start, exclusive evaluation date. Only executed-verified entries
- * for the same payer and the same change type count; counting never reorders
- * or mutates the supplied history and is invariant to its order.
+ * Rolling window (evaluationDate minus rollingPeriodMonths, evaluationDate]:
+ * EXCLUSIVE lower boundary, INCLUSIVE evaluation date — the approved
+ * date-only MVP boundary. A verified change executed on the evaluation
+ * merchant date counts immediately; an entry dated exactly
+ * rollingPeriodMonths before the evaluation date is outside the window; an
+ * entry dated after the evaluation date never counts. Only executed-verified
+ * entries for the same payer and the same change type count; counting never
+ * reorders or mutates the supplied history and is invariant to its order.
  */
 function countVerifiedUses(
   history: readonly PriorScheduleChange[],
@@ -693,7 +697,9 @@ function countVerifiedUses(
   rollingPeriodMonths: number,
 ): number {
   const evaluation = parseCalendarDate(evaluationDate) as CalendarDate;
-  const windowStart = formatCalendarDate(monthsEarlier(evaluation, rollingPeriodMonths));
+  const exclusiveLowerBoundary = formatCalendarDate(
+    monthsEarlier(evaluation, rollingPeriodMonths),
+  );
   let count = 0;
   for (const entry of history) {
     if (
@@ -704,7 +710,10 @@ function countVerifiedUses(
     ) {
       continue;
     }
-    if (entry.executedDate >= windowStart && entry.executedDate < evaluationDate) {
+    if (
+      entry.executedDate > exclusiveLowerBoundary &&
+      entry.executedDate <= evaluationDate
+    ) {
       count += 1;
     }
   }

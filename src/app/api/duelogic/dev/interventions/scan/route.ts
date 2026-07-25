@@ -94,6 +94,23 @@ export async function POST(request: NextRequest) {
         inboxPath: "/dev/duelogic/inbox",
       });
     }
+    if (outcome.outcome === "policy-review-required") {
+      // The policy engine, evaluating the candidate under the active saved
+      // policy with the payer's derived prior-change history, reports the
+      // rolling permanent allowance as exhausted: no invitation, token,
+      // notification or preview exists. Merchant-safe vocabulary only.
+      console.error("Dev intervention scan requires merchant policy review.", {
+        reason: outcome.reason,
+      });
+      return NextResponse.json(
+        {
+          ok: false,
+          stage: "policy-review-required",
+          reason: outcome.reason,
+        },
+        { status: 409 },
+      );
+    }
     if (outcome.outcome === "fixture-error") {
       // Safe stage vocabulary only — never Pinch response content. An
       // ambiguous or failed resolution is a development fixture error and

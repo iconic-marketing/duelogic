@@ -974,17 +974,20 @@ export function validatePolicyEngine(): PolicyEngineValidationResult {
   }
 
   {
+    // Approved boundary: the lower boundary is EXCLUSIVE, so an entry dated
+    // exactly rollingPeriodMonths before the evaluation date is outside the
+    // window (evaluation 2026-01-05, entry 2025-01-05).
     const decision = asApprovedTemporary(
-      "48-change-on-window-start",
+      "48-change-on-exact-lower-boundary",
       decide(
-        "48-change-on-window-start",
+        "48-change-on-exact-lower-boundary",
         temporaryRequest(),
         [verifiedChange("prior-08", "temporary", "2025-01-05")],
       ),
     );
     check(
-      decision.usage.verifiedUsesInPeriod === 1,
-      "48: a change exactly on the rolling-window start must count",
+      decision.usage.verifiedUsesInPeriod === 0,
+      "48: a change exactly 12 months before the evaluation date must no longer count",
     );
   }
 
@@ -1004,6 +1007,9 @@ export function validatePolicyEngine(): PolicyEngineValidationResult {
   }
 
   {
+    // Approved boundary: the evaluation date is INCLUSIVE, so a verified
+    // change completed earlier on the evaluation merchant date counts
+    // immediately (temporary allowance is 2, so this remains approved).
     const decision = asApprovedTemporary(
       "50-change-on-evaluation-date",
       decide(
@@ -1013,8 +1019,8 @@ export function validatePolicyEngine(): PolicyEngineValidationResult {
       ),
     );
     check(
-      decision.usage.verifiedUsesInPeriod === 0,
-      "50: a change on the exclusive evaluationDate must not count",
+      decision.usage.verifiedUsesInPeriod === 1,
+      "50: a change on the inclusive evaluation date must count immediately",
     );
   }
 
@@ -1276,6 +1282,109 @@ export function validatePolicyEngine(): PolicyEngineValidationResult {
       }),
     ),
   );
+
+  // -------------------------------------------------------------------------
+  // J. Approved rolling-window boundary (date-only MVP interpretation)
+  //
+  // Renee-approved semantics: a verified use counts when
+  //   executedDate > (evaluationDate - rollingPeriodMonths)
+  //   AND executedDate <= evaluationDate.
+  // PriorScheduleChange carries executedDate (a merchant calendar date, no
+  // timestamp), and trusted history is created only from already completed
+  // interventions, so an executed-verified entry dated on the evaluation
+  // date counts immediately; the exact lower-boundary date is excluded;
+  // future-dated entries never count.
+  //
+  // These boundary proofs assert through check() with direct engine calls —
+  // they add no decision-table rows, so the sibling suites' pinned
+  // 78-row cross-check remains valid while every boundary assertion still
+  // runs (and throws on regression) on each validatePolicyEngine() pass.
+
+  /** Monthly permanent request over July 2026 with evaluation 2026-07-25. */
+  const julyPermanentRequest = (): PermanentPolicyEvaluationRequest => ({
+    changeType: "permanent",
+    payerId: PAYER_ID,
+    paymentId: "payment-fixture-boundary",
+    amountCents: 12500,
+    currentArrearsCents: 0,
+    evaluationDate: "2026-07-25",
+    scheduleCadence: "monthly",
+    effectiveCycle: "current-and-future",
+    previousPaymentDate: "2026-06-28",
+    currentPaymentDate: "2026-07-28",
+    nextPaymentDate: "2026-08-28",
+    currentCycleStartDate: "2026-07-01",
+    currentCycleEndDate: "2026-07-31",
+    nextCycleStartDate: "2026-08-01",
+    nextCycleEndDate: "2026-08-31",
+    requestedAnchorDate: "2026-07-27",
+  });
+
+  // B1: a correction completed earlier on the evaluation merchant date
+  // counts immediately, so a second same-day permanent request escalates.
+  asEscalation(
+    "boundary-same-evaluation-date-counts",
+    evaluateScheduleChange(
+      julyPermanentRequest(),
+      [verifiedChange("prior-19", "permanent", "2026-07-25")],
+      DEFAULT_DUELOGIC_POLICY,
+    ),
+    "PERMANENT_CHANGE_LIMIT_REACHED",
+    "permanentChange.maxVerifiedUses",
+  );
+
+  // B2: the day before the evaluation date counts.
+  asEscalation(
+    "boundary-day-before-evaluation-counts",
+    evaluateScheduleChange(
+      julyPermanentRequest(),
+      [verifiedChange("prior-20", "permanent", "2026-07-24")],
+      DEFAULT_DUELOGIC_POLICY,
+    ),
+    "PERMANENT_CHANGE_LIMIT_REACHED",
+    "permanentChange.maxVerifiedUses",
+  );
+
+  // B3: the exact lower boundary (12 months before) is excluded — the
+  // request is eligible again when no other rule blocks it.
+  {
+    const decision = evaluateScheduleChange(
+      julyPermanentRequest(),
+      [verifiedChange("prior-21", "permanent", "2025-07-25")],
+      DEFAULT_DUELOGIC_POLICY,
+    );
+    check(
+      decision.outcome === "approved" &&
+        decision.usage.verifiedUsesInPeriod === 0,
+      "boundary: a correction dated exactly 12 months before the evaluation date must no longer count",
+    );
+  }
+
+  // B4: one day inside the lower boundary counts.
+  asEscalation(
+    "boundary-one-day-inside-counts",
+    evaluateScheduleChange(
+      julyPermanentRequest(),
+      [verifiedChange("prior-22", "permanent", "2025-07-26")],
+      DEFAULT_DUELOGIC_POLICY,
+    ),
+    "PERMANENT_CHANGE_LIMIT_REACHED",
+    "permanentChange.maxVerifiedUses",
+  );
+
+  // B5: an entry dated after the evaluation date does not count.
+  {
+    const decision = evaluateScheduleChange(
+      julyPermanentRequest(),
+      [verifiedChange("prior-23", "permanent", "2026-07-26")],
+      DEFAULT_DUELOGIC_POLICY,
+    );
+    check(
+      decision.outcome === "approved" &&
+        decision.usage.verifiedUsesInPeriod === 0,
+      "boundary: a correction dated after the evaluation date must not count",
+    );
+  }
 
   check(table.length === 78, `expected 78 decision-table rows, produced ${table.length}`);
 

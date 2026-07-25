@@ -74,6 +74,38 @@
  *     replacement;
  * s24 a manual-recovery outcome retains the consumed verification as
  *     evidence.
+ *
+ * The prior-change-history scenarios (s25-s35): verified executed
+ * interventions become payer-keyed PriorScheduleChange history through the
+ * pure derivation module (src/lib/duelogic/prior-change-history.ts), the
+ * scheduled scan and customer date evaluation pass that derived history to
+ * the policy engine — the sole authority for rolling-window counting — and:
+ * s25 the first permanent use remains eligible (scan creates, evaluation
+ *     approves);
+ * s26 a second permanent request on the SAME merchant date as the verified
+ *     correction makes the scan require merchant policy review with no
+ *     invitation, token or notification (the approved upper-inclusive
+ *     boundary counts a same-day correction immediately);
+ * s27 subscription replacement continuity: the prior correction references
+ *     the original subscription, the candidate references its replacement,
+ *     and the same payer's same-day use still counts — customer evaluation
+ *     escalates with PERMANENT_CHANGE_LIMIT_REACHED before any preview
+ *     read;
+ * s28 a different payer derives no history and remains eligible;
+ * s29 the rolling-window boundary is exactly the engine's approved
+ *     semantics: lower boundary exclusive (the exact 12-month date is
+ *     eligible again), one day inside still counts;
+ * s30 manual-recovery maps to non-counting audit evidence only;
+ * s31 refused, reverted, declined, expired and linkage-missing records
+ *     produce no history;
+ * s32 executed-verified temporary history never consumes the permanent
+ *     allowance;
+ * s33 duplicate evidence for one operationId deduplicates to one entry;
+ * s34 execution instants convert to merchant-calendar executed dates
+ *     through the timezone-aware formatter, never by slicing;
+ * s35 history derivation and enforcement are read-only — no store write,
+ *     no notification, no verification record and no mutation-shaped
+ *     effect.
  */
 
 import {
@@ -112,11 +144,17 @@ import {
   type TransactionVerificationRecord,
 } from "./transaction-verification";
 import { createInMemoryMerchantPolicyRepository } from "./policy/dev-policy-store";
+import {
+  evaluateScheduleChange,
+  type PermanentPolicyEvaluationRequest,
+} from "./policy/engine";
 import type {
   MerchantPolicyRepository,
   MerchantPolicySnapshot,
 } from "./policy/policy-snapshot";
 import { DEFAULT_DUELOGIC_POLICY } from "./policy/rules";
+import { toPriorScheduleChanges } from "./prior-change-history";
+import type { PriorScheduleChange } from "./schema";
 import { addCalendarDays } from "./calendar-date";
 import type {
   SubscriptionDetailSnapshot,
@@ -1911,6 +1949,659 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       "s24: the consumed verification must be retained as evidence",
     );
     record("s24-failure-retains-consumed-verification", "evidence-retained");
+  }
+
+  // -------------------------------------------------------------------
+  // Prior-change-history fixtures (s25-s35). All synthetic: crafted
+  // records use demo identifiers only, clocks are injected, and every
+  // policy decision comes from the engine — never a re-implemented count.
+
+  /** Clock whose Sydney calendar date is 2026-07-26 (a day after SCAN_CLOCK_START's). */
+  const HISTORY_EVALUATION_CLOCK = "2026-07-26T00:00:00.000Z";
+
+  /** Raw token of the crafted pending invitation; hashed directly, never generated. */
+  const PENDING_RAW_TOKEN = "raw-demo-pending-01";
+
+  /** The replacement subscription the fakes serve after a verified execution. */
+  const replacementSubscription = (): SubscriptionDetailSnapshot => ({
+    id: "sub_demo_replacement",
+    payerId: "pyr_demo",
+    planId: "pln_demo",
+    status: "Active",
+    startDate: "2026-08-18",
+    sourceId: "src_demo",
+    recurringAmountCents: 12500,
+  });
+
+  /**
+   * A pending invitation for the REPLACEMENT subscription: the candidate a
+   * later scan would have produced, awaiting the customer's date. Inside
+   * the anchored cycle 2026-08-11..2026-08-24 with suggested 2026-08-22.
+   */
+  const syntheticPendingInvitation = (
+    harness: Harness,
+    nowIso: string,
+  ): DueLogicInterventionRecord => ({
+    interventionId: "int_demo_pending",
+    notificationId: "ntf_demo_pending",
+    tokenHash: harness.tokenDeps.hashToken(PENDING_RAW_TOKEN),
+    merchantId: DEMO_FIXTURE.merchantId,
+    payerId: DEMO_FIXTURE.payerId,
+    sourceId: DEMO_FIXTURE.sourceId,
+    subscriptionId: "sub_demo_replacement",
+    planId: DEMO_FIXTURE.planId,
+    patternFlagId: "flag_demo_pending",
+    policyVersion: DEFAULT_DUELOGIC_POLICY.version,
+    scheduleCadence: "fortnightly",
+    changeMode: "permanent",
+    currentStartDate: "2026-08-18",
+    currentPaymentAmountInCents: 12500,
+    currentCycleStartDate: "2026-08-11",
+    currentCycleEndDate: "2026-08-24",
+    suggestedDate: "2026-08-22",
+    selectedDate: null,
+    offeredAlternativeDate: null,
+    policyOutcome: null,
+    policyReasonCode: null,
+    policyRuleFired: null,
+    policyExplanation: null,
+    policyWarnings: [],
+    currentPayments: null,
+    proposedPayments: null,
+    currency: "AUD",
+    confirmationId: null,
+    operationId: null,
+    newSubscriptionId: null,
+    status: "opened",
+    createdAt: nowIso,
+    expiresAt: "2026-08-10T00:00:00.000Z",
+    openedAt: nowIso,
+    selectedAt: null,
+    declinedAt: null,
+    updatedAt: nowIso,
+  });
+
+  /**
+   * A verified executed intervention: the prior permanent correction, with
+   * the complete linkage and updatedAt as the execution write-back instant
+   * (the executed status is terminal, so that field never moves again).
+   */
+  const syntheticExecutedIntervention = (
+    operationId: string,
+    executedAtIso: string,
+    overrides: Partial<DueLogicInterventionRecord> = {},
+  ): DueLogicInterventionRecord => ({
+    interventionId: `int_demo_hist_${operationId}`,
+    notificationId: `ntf_demo_hist_${operationId}`,
+    tokenHash: `fakehash:hist-${operationId}`,
+    merchantId: DEMO_FIXTURE.merchantId,
+    payerId: DEMO_FIXTURE.payerId,
+    sourceId: DEMO_FIXTURE.sourceId,
+    subscriptionId: "sub_demo_active",
+    planId: DEMO_FIXTURE.planId,
+    patternFlagId: "flag_demo_hist",
+    policyVersion: DEFAULT_DUELOGIC_POLICY.version,
+    scheduleCadence: "fortnightly",
+    changeMode: "permanent",
+    currentStartDate: "2026-08-14",
+    currentPaymentAmountInCents: 12500,
+    currentCycleStartDate: "2026-08-11",
+    currentCycleEndDate: "2026-08-24",
+    suggestedDate: "2026-08-18",
+    selectedDate: "2026-08-18",
+    offeredAlternativeDate: null,
+    policyOutcome: "approved",
+    policyReasonCode: "POLICY_APPROVED",
+    policyRuleFired: "all-policy-rules-passed",
+    policyExplanation: null,
+    policyWarnings: [],
+    currentPayments: threePaymentsFrom("2026-08-14"),
+    proposedPayments: threePaymentsFrom("2026-08-18"),
+    currency: "AUD",
+    confirmationId: `conf_demo_hist_${operationId}`,
+    operationId,
+    newSubscriptionId: "sub_demo_replacement",
+    status: "executed",
+    createdAt: executedAtIso,
+    expiresAt: executedAtIso,
+    openedAt: executedAtIso,
+    selectedAt: executedAtIso,
+    declinedAt: null,
+    updatedAt: executedAtIso,
+    ...overrides,
+  });
+
+  /** Evaluate the pending invitation's suggested date with tracked preview reads. */
+  const evaluatePendingSuggestedDate = async (harness: Harness) => {
+    const preview = makePreviewReads(replacementSubscription());
+    const outcome = await evaluateSelectedDate(
+      { token: PENDING_RAW_TOKEN, selectedDate: "2026-08-22" },
+      DEMO_FIXTURE,
+      {
+        repository: harness.repository,
+        policies: harness.policies,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+        previewReads: preview.effects,
+      },
+    );
+    return { outcome, previewCalls: preview.calls };
+  };
+
+  /** Real executed lineage through the actual internal execution path. */
+  const executeFirstCorrection = async (
+    harness: Harness,
+  ): Promise<DueLogicInterventionRecord> => {
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const outcome = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(outcome.ok, "history fixture: the first correction must execute");
+    return (outcome as { record: DueLogicInterventionRecord }).record;
+  };
+
+  /** The trusted candidate request the scan builds, for engine-level asserts. */
+  const candidatePermanentRequest = (
+    payerId: string,
+    evaluationDate: string,
+  ): PermanentPolicyEvaluationRequest => ({
+    changeType: "permanent",
+    payerId,
+    paymentId: "sub_demo_replacement-first-payment",
+    amountCents: 12500,
+    evaluationDate,
+    currentArrearsCents: 0,
+    scheduleCadence: "fortnightly",
+    effectiveCycle: "current-and-future",
+    previousPaymentDate: "2026-06-28",
+    currentPaymentDate: "2026-08-18",
+    nextPaymentDate: "2026-09-01",
+    currentCycleStartDate: "2026-08-11",
+    currentCycleEndDate: "2026-08-24",
+    nextCycleStartDate: "2026-08-25",
+    nextCycleEndDate: "2026-09-07",
+    requestedAnchorDate: "2026-08-22",
+  });
+
+  // s25: with no prior executed-verified permanent correction the payer's
+  // first use remains eligible: the scan creates the routine invitation and
+  // customer evaluation approves; in-progress records derive no history.
+  {
+    const harness = await makeHarness();
+    check(
+      toPriorScheduleChanges(
+        await harness.repository.list(),
+        DEMO_FIXTURE.payerId,
+        DEMO_FIXTURE.merchantTimezone,
+      ).length === 0,
+      "s25: an empty repository must derive empty history",
+    );
+    const previewReady = await toPreviewReady(harness);
+    check(
+      previewReady.policyOutcome === "approved" &&
+        previewReady.status === "preview-ready",
+      "s25: the first permanent use must be approved to preview-ready",
+    );
+    check(
+      toPriorScheduleChanges(
+        await harness.repository.list(),
+        DEMO_FIXTURE.payerId,
+        DEMO_FIXTURE.merchantTimezone,
+      ).length === 0,
+      "s25: an in-progress invitation must derive no history entry",
+    );
+    record("s25-first-permanent-use-eligible", "approved");
+  }
+
+  // s26: after one verified execution, a scan on the SAME merchant date —
+  // now resolving the REPLACEMENT subscription — must require merchant
+  // policy review: the approved upper-inclusive boundary counts the
+  // same-day correction immediately, the engine escalates on the derived
+  // history, and no invitation, token or notification is created.
+  {
+    const harness = await makeHarness();
+    const executed = await executeFirstCorrection(harness);
+    check(
+      executed.subscriptionId === "sub_demo_active",
+      "s26: the prior correction must reference the original subscription",
+    );
+    const derived = toPriorScheduleChanges(
+      await harness.repository.list(),
+      DEMO_FIXTURE.payerId,
+      DEMO_FIXTURE.merchantTimezone,
+    );
+    check(
+      derived.length === 1 &&
+        derived[0].status === "executed-verified" &&
+        derived[0].changeType === "permanent" &&
+        derived[0].id === "op_demo_01" &&
+        derived[0].executedDate === "2026-07-25",
+      "s26: the verified execution must derive one executed-verified permanent entry",
+    );
+    const reads = makeSubscriptionReads([replacementSubscription()]);
+    const interventionsBefore = (await harness.repository.list()).length;
+    const notificationsBefore = (await harness.notifications.list()).length;
+    const outcome = await runScheduledInterventionScan(DEMO_FIXTURE, {
+      ...harness.scanDeps,
+      subscriptionReads: reads.effects,
+    });
+    check(
+      outcome.outcome === "policy-review-required" &&
+        outcome.reason === "permanent-change-limit-reached",
+      `s26: the second scan must require merchant policy review (got ${outcome.outcome})`,
+    );
+    check(
+      (await harness.repository.list()).length === interventionsBefore,
+      "s26: the escalated scan must create no invitation",
+    );
+    check(
+      (await harness.notifications.list()).length === notificationsBefore,
+      "s26: the escalated scan must create no notification and no token",
+    );
+    record("s26-second-permanent-request-escalates", "policy-review-required");
+  }
+
+  // s27: subscription replacement continuity, on the SAME merchant date as
+  // the verified correction. The executed correction references the
+  // ORIGINAL subscription; the pending candidate references the
+  // REPLACEMENT subscription; the payer is unchanged, so the same-day
+  // prior use counts immediately: customer evaluation escalates with
+  // PERMANENT_CHANGE_LIMIT_REACHED under permanentChange.maxVerifiedUses,
+  // before any preview read, creating no execution state, and the
+  // protected execution path stays unreachable.
+  {
+    const harness = await makeHarness();
+    const executed = await executeFirstCorrection(harness);
+    const pending = syntheticPendingInvitation(harness, harness.clock.now());
+    await harness.repository.write(pending);
+    check(
+      executed.subscriptionId === "sub_demo_active" &&
+        pending.subscriptionId === "sub_demo_replacement" &&
+        executed.payerId === pending.payerId,
+      "s27: original and replacement subscriptions must differ for the same payer",
+    );
+    const { outcome, previewCalls } = await evaluatePendingSuggestedDate(harness);
+    check(
+      outcome.ok &&
+        outcome.record.policyOutcome === "escalate" &&
+        outcome.record.policyReasonCode === "PERMANENT_CHANGE_LIMIT_REACHED" &&
+        outcome.record.policyRuleFired === "permanentChange.maxVerifiedUses" &&
+        outcome.record.status === "escalated",
+      "s27: the second permanent request must escalate on the payer's prior use",
+    );
+    check(
+      previewCalls.length === 0,
+      "s27: no Pinch preview read may occur for the escalated request",
+    );
+    check(
+      outcome.ok &&
+        outcome.record.confirmationId === null &&
+        outcome.record.operationId === null &&
+        outcome.record.newSubscriptionId === null,
+      "s27: the escalation must create no confirmation or execution state",
+    );
+    const execution = makeExecutionHarness(harness);
+    const confirmAttempt = await confirmInterventionExecution(
+      { token: PENDING_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !confirmAttempt.ok &&
+        confirmAttempt.reason === "escalated" &&
+        execution.pathCalls.length === 0 &&
+        execution.confirmationsCreated() === 0,
+      "s27: the protected execution path must remain unreachable",
+    );
+    record("s27-replacement-subscription-continuity", "prior-use-counts");
+  }
+
+  // s28: a different payer derives no history from this payer's records,
+  // and the engine never counts another payer's entries.
+  {
+    const harness = await makeHarness();
+    await executeFirstCorrection(harness);
+    harness.clock.advanceMinutes(24 * 60);
+    const records = await harness.repository.list();
+    check(
+      toPriorScheduleChanges(
+        records,
+        "pyr_demo_other",
+        DEMO_FIXTURE.merchantTimezone,
+      ).length === 0,
+      "s28: another payer must derive no history from this payer's records",
+    );
+    const decision = evaluateScheduleChange(
+      candidatePermanentRequest("pyr_demo_other", "2026-07-26"),
+      toPriorScheduleChanges(
+        records,
+        DEMO_FIXTURE.payerId,
+        DEMO_FIXTURE.merchantTimezone,
+      ),
+      DEFAULT_DUELOGIC_POLICY,
+    );
+    check(
+      decision.outcome === "approved",
+      "s28: the engine must not count another payer's history",
+    );
+    record("s28-different-payer-unaffected", "eligible");
+  }
+
+  // s29: the rolling-window boundary is exactly the engine's approved
+  // semantics — lower boundary EXCLUSIVE. Evaluation date 2026-07-26
+  // (Sydney) puts the exclusive lower boundary at 2025-07-26: an execution
+  // dated exactly 12 months earlier no longer counts (eligible again), one
+  // merchant-calendar day inside the window still counts, and a correction
+  // far outside the period leaves the payer eligible.
+  {
+    const boundaryCase = async (executedAtIso: string) => {
+      const harness = await makeHarness(HISTORY_EVALUATION_CLOCK);
+      await harness.repository.write(
+        syntheticExecutedIntervention("op_demo_hist", executedAtIso),
+      );
+      await harness.repository.write(
+        syntheticPendingInvitation(harness, harness.clock.now()),
+      );
+      return evaluatePendingSuggestedDate(harness);
+    };
+    // Sydney 2025-06-15 — far outside the rolling period.
+    const outside = await boundaryCase("2025-06-15T02:00:00.000Z");
+    check(
+      outside.outcome.ok &&
+        outside.outcome.record.policyOutcome === "approved" &&
+        outside.outcome.record.status === "preview-ready",
+      "s29: a correction outside the rolling period must leave the payer eligible",
+    );
+    // Sydney 2025-07-26 10:00 — exactly 12 months before the evaluation
+    // date: the exclusive lower boundary, no longer counted.
+    const atLowerBoundary = await boundaryCase("2025-07-26T00:00:00.000Z");
+    check(
+      atLowerBoundary.outcome.ok &&
+        atLowerBoundary.outcome.record.policyOutcome === "approved" &&
+        atLowerBoundary.outcome.record.status === "preview-ready",
+      "s29: a correction dated exactly 12 months earlier must be eligible again",
+    );
+    // Sydney 2025-07-27 10:00 — one merchant-calendar day inside the
+    // window: still counts.
+    const oneDayInside = await boundaryCase("2025-07-27T00:00:00.000Z");
+    check(
+      oneDayInside.outcome.ok &&
+        oneDayInside.outcome.record.policyReasonCode ===
+          "PERMANENT_CHANGE_LIMIT_REACHED",
+      "s29: a correction one day inside the lower boundary must still count",
+    );
+    // Sydney 2025-07-25 23:59 — one merchant-calendar day before the
+    // boundary date, clearly outside.
+    const justBefore = await boundaryCase("2025-07-25T13:59:00.000Z");
+    check(
+      justBefore.outcome.ok &&
+        justBefore.outcome.record.policyOutcome === "approved",
+      "s29: the day before the boundary date must not count",
+    );
+    record("s29-rolling-window-boundary", "engine-exact");
+  }
+
+  // s30: manual-recovery-required maps to a non-counting "manual-recovery"
+  // entry — audit evidence that never consumes maxVerifiedUses.
+  {
+    const harness = await makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness, { createFails: true });
+    const failed = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      execution.deps,
+    );
+    check(
+      !failed.ok && failed.reason === "manual-recovery-required",
+      "s30 fixture: the post-cancellation failure must report manual recovery",
+    );
+    harness.clock.advanceMinutes(24 * 60);
+    const derived = toPriorScheduleChanges(
+      await harness.repository.list(),
+      DEMO_FIXTURE.payerId,
+      DEMO_FIXTURE.merchantTimezone,
+    );
+    check(
+      derived.length === 1 &&
+        derived[0].status === "manual-recovery" &&
+        derived[0].changeType === "permanent" &&
+        derived[0].id === "op_demo_01" &&
+        derived[0].executedDate === undefined,
+      "s30: manual recovery must derive audit evidence only, never executed-verified",
+    );
+    const decision = evaluateScheduleChange(
+      candidatePermanentRequest(DEMO_FIXTURE.payerId, "2026-07-26"),
+      derived,
+      DEFAULT_DUELOGIC_POLICY,
+    );
+    check(
+      decision.outcome === "approved",
+      "s30: manual recovery must not consume the permanent allowance",
+    );
+    record("s30-manual-recovery-not-counted", "audit-evidence-only");
+  }
+
+  // s31: refused (pre-mutation revert to preview-ready), declined, expired
+  // and linkage-missing records produce no history entries at all.
+  {
+    const harness = await makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const refusingDeps: InterventionExecutionDeps = {
+      ...execution.deps,
+      executeReplacementPath: async () => ({
+        kind: "refused",
+        stage: "confirmation-stale",
+      }),
+    };
+    const refused = await confirmInterventionExecution(
+      { token: FIRST_RAW_TOKEN },
+      refusingDeps,
+    );
+    check(
+      !refused.ok && refused.reason === "refused",
+      "s31 fixture: the pre-mutation refusal must revert",
+    );
+    const reverted = await harness.repository.readByTokenHash(
+      harness.tokenDeps.hashToken(FIRST_RAW_TOKEN),
+    );
+    check(
+      reverted !== null &&
+        reverted.status === "preview-ready" &&
+        reverted.operationId === null,
+      "s31 fixture: the reverted record must carry cleared linkage",
+    );
+    await harness.repository.write(
+      syntheticExecutedIntervention("op_demo_nolink", "2026-07-25T00:10:00.000Z", {
+        interventionId: "int_demo_nolink",
+        tokenHash: "fakehash:nolink",
+        newSubscriptionId: null,
+      }),
+    );
+    await harness.repository.write(
+      syntheticExecutedIntervention("op_demo_declined", "2026-07-25T00:11:00.000Z", {
+        interventionId: "int_demo_declined",
+        tokenHash: "fakehash:declined",
+        status: "declined",
+        declinedAt: "2026-07-25T00:11:00.000Z",
+        confirmationId: null,
+        operationId: null,
+        newSubscriptionId: null,
+      }),
+    );
+    await harness.repository.write({
+      ...syntheticPendingInvitation(harness, "2026-07-01T00:00:00.000Z"),
+      interventionId: "int_demo_expired",
+      tokenHash: "fakehash:expired",
+      expiresAt: "2026-07-02T00:00:00.000Z",
+    });
+    const derived = toPriorScheduleChanges(
+      await harness.repository.list(),
+      DEMO_FIXTURE.payerId,
+      DEMO_FIXTURE.merchantTimezone,
+    );
+    check(
+      derived.length === 0,
+      "s31: no refused, declined, expired or linkage-missing record may derive history",
+    );
+    record("s31-unsuccessful-outcomes-excluded", "no-history");
+  }
+
+  // s32: executed-verified temporary history never consumes the permanent
+  // allowance — the counters are separate; adding a real permanent entry
+  // alongside it escalates, proving the permanent entry alone counts.
+  {
+    const temporaryUse: PriorScheduleChange = {
+      id: "hist_temp_01",
+      payerId: DEMO_FIXTURE.payerId,
+      changeType: "temporary",
+      status: "executed-verified",
+      executedDate: "2026-07-10",
+    };
+    const temporaryOnly = evaluateScheduleChange(
+      candidatePermanentRequest(DEMO_FIXTURE.payerId, "2026-07-26"),
+      [temporaryUse],
+      DEFAULT_DUELOGIC_POLICY,
+    );
+    check(
+      temporaryOnly.outcome === "approved",
+      "s32: a temporary executed-verified entry must not consume the permanent allowance",
+    );
+    const permanentUse: PriorScheduleChange = {
+      id: "hist_perm_01",
+      payerId: DEMO_FIXTURE.payerId,
+      changeType: "permanent",
+      status: "executed-verified",
+      executedDate: "2026-07-10",
+    };
+    const combined = evaluateScheduleChange(
+      candidatePermanentRequest(DEMO_FIXTURE.payerId, "2026-07-26"),
+      [temporaryUse, permanentUse],
+      DEFAULT_DUELOGIC_POLICY,
+    );
+    check(
+      combined.outcome === "escalate" &&
+        combined.reasonCode === "PERMANENT_CHANGE_LIMIT_REACHED",
+      "s32: the permanent entry alone must consume the permanent allowance",
+    );
+    record("s32-temporary-history-separate-counter", "not-counted");
+  }
+
+  // s33: duplicate repository evidence for one operationId deduplicates to
+  // a single entry keeping the earliest executed date, input-order
+  // invariant.
+  {
+    const harness = await makeHarness(HISTORY_EVALUATION_CLOCK);
+    await harness.repository.write(
+      syntheticExecutedIntervention("op_demo_dup", "2026-07-10T01:00:00.000Z"),
+    );
+    await harness.repository.write(
+      syntheticExecutedIntervention("op_demo_dup", "2026-07-12T01:00:00.000Z", {
+        interventionId: "int_demo_dup_2",
+        tokenHash: "fakehash:dup2",
+      }),
+    );
+    const derived = toPriorScheduleChanges(
+      await harness.repository.list(),
+      DEMO_FIXTURE.payerId,
+      DEMO_FIXTURE.merchantTimezone,
+    );
+    check(
+      derived.length === 1 &&
+        derived[0].id === "op_demo_dup" &&
+        derived[0].status === "executed-verified" &&
+        derived[0].executedDate === "2026-07-10",
+      "s33: duplicate operation evidence must deduplicate to one entry",
+    );
+    record("s33-duplicate-operation-evidence-deduplicated", "one-entry");
+  }
+
+  // s34: execution instants convert to the merchant-calendar executed date
+  // through the timezone-aware formatter — an instant after Sydney
+  // midnight lands on the next calendar day, never the sliced UTC date.
+  {
+    const harness = await makeHarness(HISTORY_EVALUATION_CLOCK);
+    // 2026-07-10T14:30Z is 2026-07-11 00:30 in Australia/Sydney.
+    await harness.repository.write(
+      syntheticExecutedIntervention("op_demo_tz1", "2026-07-10T14:30:00.000Z"),
+    );
+    // 2026-07-10T13:30Z is 2026-07-10 23:30 in Australia/Sydney.
+    await harness.repository.write(
+      syntheticExecutedIntervention("op_demo_tz2", "2026-07-10T13:30:00.000Z"),
+    );
+    const derived = toPriorScheduleChanges(
+      await harness.repository.list(),
+      DEMO_FIXTURE.payerId,
+      DEMO_FIXTURE.merchantTimezone,
+    );
+    const acrossMidnight = derived.find((entry) => entry.id === "op_demo_tz1");
+    const beforeMidnight = derived.find((entry) => entry.id === "op_demo_tz2");
+    check(
+      acrossMidnight?.executedDate === "2026-07-11" &&
+        beforeMidnight?.executedDate === "2026-07-10",
+      "s34: executed dates must be merchant-calendar dates, never sliced UTC",
+    );
+    record("s34-merchant-timezone-execution-date", "converted");
+  }
+
+  // s35: history derivation and enforcement are strictly read-only — the
+  // input records are not mutated, the escalated scan writes no
+  // intervention state, creates no notification, runs only read-shaped
+  // subscription effects, and no verification record exists anywhere.
+  {
+    const harness = await makeHarness();
+    await executeFirstCorrection(harness);
+    harness.clock.advanceMinutes(24 * 60);
+    const recordsBefore = await harness.repository.list();
+    const snapshotBefore = JSON.stringify(recordsBefore);
+    const derived = toPriorScheduleChanges(
+      recordsBefore,
+      DEMO_FIXTURE.payerId,
+      DEMO_FIXTURE.merchantTimezone,
+    );
+    check(
+      JSON.stringify(recordsBefore) === snapshotBefore,
+      "s35: derivation must not mutate its input records",
+    );
+    check(derived.length === 1, "s35 fixture: one verified entry must derive");
+    const reads = makeSubscriptionReads([replacementSubscription()]);
+    const notificationsBefore = JSON.stringify(
+      await harness.notifications.list(),
+    );
+    const outcome = await runScheduledInterventionScan(DEMO_FIXTURE, {
+      ...harness.scanDeps,
+      subscriptionReads: reads.effects,
+    });
+    check(
+      outcome.outcome === "policy-review-required",
+      "s35: the enforcement path must escalate to merchant review",
+    );
+    check(
+      JSON.stringify(await harness.repository.list()) === snapshotBefore,
+      "s35: the escalated scan must write no intervention state",
+    );
+    check(
+      JSON.stringify(await harness.notifications.list()) ===
+        notificationsBefore,
+      "s35: the escalated scan must create no notification",
+    );
+    check(
+      reads.calls.every(
+        (call) => call.startsWith("list:") || call.startsWith("read:"),
+      ),
+      "s35: only read-shaped subscription effects may run",
+    );
+    const verifications = createInMemoryTransactionVerificationRepository();
+    for (const stored of recordsBefore) {
+      check(
+        (await verifications.readVerifiedForIntervention(
+          stored.interventionId,
+        )) === null,
+        "s35: no verification record may exist for any intervention",
+      );
+    }
+    record("s35-history-enforcement-reads-only", "no-mutation");
   }
 
   return { scenarioCount: table.length, decisionTable: table };
