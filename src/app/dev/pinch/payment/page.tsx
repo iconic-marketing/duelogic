@@ -1,4 +1,5 @@
 import { headers } from "next/headers";
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import { areLocalhostRequestHeaders } from "@/lib/dev/localhost-guard";
 import { PaymentControl } from "./payment-control";
@@ -26,6 +27,11 @@ export default async function LivePaymentControlPage() {
 
   return (
     <main className="mx-auto w-full max-w-2xl px-6 py-10 font-sans">
+      <p className="mb-4 text-sm">
+        <Link href="/" className="font-medium underline underline-offset-4">
+          ← DueLogic dashboard
+        </Link>
+      </p>
       <h1 className="text-2xl font-semibold tracking-tight">
         DueLogic live payment control
       </h1>

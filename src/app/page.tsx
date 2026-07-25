@@ -1,65 +1,177 @@
-import Image from "next/image";
+import Link from "next/link";
+import { addCalendarDays } from "@/lib/duelogic/calendar-date";
+import { detectTimingLinkedPatterns } from "@/lib/duelogic/pattern-detector";
+import {
+  validateDetectionWindowSemantics,
+  validateSeedPatternDetection,
+} from "@/lib/duelogic/pattern-detector-validation";
+import {
+  evaluateScheduleChange,
+  type PolicyDecision,
+  type TemporaryPolicyEvaluationRequest,
+} from "@/lib/duelogic/policy/engine";
+import { validatePlanScheduleResolver } from "@/lib/duelogic/policy/plan-schedule-validation";
+import { DEFAULT_DUELOGIC_POLICY } from "@/lib/duelogic/policy/rules";
+import { validatePolicyEngine } from "@/lib/duelogic/policy/validation";
+import type { Payer } from "@/lib/duelogic/schema";
+import {
+  seedMerchant,
+  seedPayers,
+  seedPaymentRecords,
+  seedSummary,
+} from "@/lib/duelogic/seed-payment-history";
+import { validateReplacementOperationRecovery } from "@/lib/pinch/replacement-operation-validation";
+import { MerchantSummary } from "./merchant-summary";
+import { PatternPanel } from "./pattern-panel";
+import { PaymentHistory } from "./payment-history";
+import { PolicyPanel } from "./policy-panel";
+import { ReplacementPanel } from "./replacement-panel";
 
-export default function Home() {
+/**
+ * The DueLogic merchant dashboard: one page over the frozen deterministic
+ * capabilities. Sections 1-5 (summary, history, detected patterns, policy
+ * decisions) are server-rendered from the synthetic seed, the detector and
+ * the policy engine — no Pinch call, no clock read, no model output. The
+ * live permanent-replacement journey is a client panel over the existing
+ * localhost-only dev routes and fires nothing until its button is pressed.
+ *
+ * Following the dev-route convention, the deterministic validation suites
+ * are re-asserted on every render; any regression fails the render loudly
+ * rather than showing stale claims.
+ */
+
+/**
+ * The next scheduled debit after the seeded twelve months for each
+ * intentionally planted pattern payer — explicit demonstration fixture data
+ * (the seed is documented as one debit per payer per month), never inferred
+ * at runtime from payment spacing. The requested date is derived from the
+ * detector's own proposedShiftDays.
+ */
+const NEXT_SEEDED_DEBITS: Readonly<
+  Record<string, { paymentId: string; currentPaymentDate: string; amountCents: number }>
+> = {
+  "payer-01": {
+    paymentId: "pay-p01-2026-07-upcoming",
+    currentPaymentDate: "2026-07-28",
+    amountCents: 12900,
+  },
+  "payer-02": {
+    paymentId: "pay-p02-2026-07-upcoming",
+    currentPaymentDate: "2026-07-27",
+    amountCents: 24950,
+  },
+};
+
+interface PolicyEvaluationItem {
+  payer: Payer;
+  request: TemporaryPolicyEvaluationRequest;
+  decision: PolicyDecision;
+}
+
+export default async function DashboardPage() {
+  // Deterministic self-checks, re-asserted per render like the dev routes.
+  validateDetectionWindowSemantics();
+  const seedValidation = validateSeedPatternDetection();
+  const policyValidation = validatePolicyEngine();
+  const planScheduleValidation = validatePlanScheduleResolver();
+  const recoveryValidation = await validateReplacementOperationRecovery();
+
+  const flags = detectTimingLinkedPatterns(seedPaymentRecords);
+  const payersById = new Map(seedPayers.map((payer) => [payer.id, payer]));
+
+  const flaggedItems = flags.flatMap((flag) => {
+    const payer = payersById.get(flag.payerId);
+    return payer === undefined ? [] : [{ payer, flag }];
+  });
+
+  const policyItems: PolicyEvaluationItem[] = flaggedItems.flatMap(
+    ({ payer, flag }) => {
+      const nextDebit = NEXT_SEEDED_DEBITS[flag.payerId];
+      if (nextDebit === undefined) {
+        return [];
+      }
+      const requestedDate = addCalendarDays(
+        nextDebit.currentPaymentDate,
+        flag.proposedShiftDays,
+      );
+      if (requestedDate === null) {
+        return [];
+      }
+      const request: TemporaryPolicyEvaluationRequest = {
+        changeType: "temporary",
+        payerId: flag.payerId,
+        paymentId: nextDebit.paymentId,
+        amountCents: nextDebit.amountCents,
+        evaluationDate: seedSummary.lastScheduledDate,
+        currentArrearsCents: 0,
+        currentPaymentDate: nextDebit.currentPaymentDate,
+        requestedDate,
+      };
+      const decision = evaluateScheduleChange(
+        request,
+        [],
+        DEFAULT_DUELOGIC_POLICY,
+      );
+      return [{ payer, request, decision }];
+    },
+  );
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-10 font-sans text-sm">
+      <header>
+        <h1 className="text-3xl font-semibold tracking-tight">DueLogic</h1>
+        <p className="mt-2 max-w-2xl text-zinc-600 dark:text-zinc-400">
+          Payment schedule intelligence that identifies recurring timing
+          patterns and helps correct future collection dates before the next
+          avoidable failure.
+        </p>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300">
+            Synthetic demonstration history
+          </span>
+          <span className="rounded-full bg-sky-100 px-2.5 py-0.5 text-xs font-medium text-sky-900 dark:bg-sky-950 dark:text-sky-300">
+            Deterministic policy evaluation
+          </span>
+          <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-medium text-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
+            Live Pinch sandbox execution
+          </span>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+        <p className="mt-4">
+          <Link
+            href="/dev/pinch/payment"
+            className="font-medium underline underline-offset-4"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+            View temporary payment control
+          </Link>
+        </p>
+      </header>
+
+      <MerchantSummary merchant={seedMerchant} summary={seedSummary} />
+      <PaymentHistory items={flaggedItems} records={seedPaymentRecords} />
+      <PatternPanel
+        items={flaggedItems}
+        asOfDate={seedSummary.lastScheduledDate}
+      />
+      <PolicyPanel items={policyItems} policy={DEFAULT_DUELOGIC_POLICY} />
+      <ReplacementPanel />
+
+      <details className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+        <summary className="cursor-pointer font-medium">
+          Fallback evidence
+        </summary>
+        <p className="mt-2 text-zinc-600 dark:text-zinc-400">
+          Captured verification evidence is available if the Pinch sandbox is
+          unavailable.
+        </p>
+      </details>
+
+      <footer className="text-xs text-zinc-500 dark:text-zinc-500">
+        Deterministic self-checks re-asserted on this render: seed pattern
+        detection ({seedValidation.flagCount} flags),{" "}
+        {policyValidation.scenarioCount} policy-engine scenarios,{" "}
+        {planScheduleValidation.scenarioCount} plan-schedule scenarios,{" "}
+        {recoveryValidation.scenarioCount} recovery-operation scenarios.
+      </footer>
+    </main>
   );
 }
