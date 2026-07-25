@@ -123,6 +123,18 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - The intervention flow lives in `src/lib/duelogic/intervention-service.ts` with injected repositories, clock, token functions and read-only Pinch effects (`intervention-pinch-reads.ts`, GET only); the store (`dev-intervention-store.ts`) is process-local, non-durable sandbox memory; the eight-scenario deterministic suite (`intervention-validation.ts`) never calls Pinch and is re-asserted by the scan route and the dashboard render.
 - A customer decline is terminal for the invitation: no further selection or preview, no Pinch call, no confirmation record.
 
+## Customer transaction verification
+
+- The tokenised customer link authorises limited access only: reviewing the payment, selecting a date, receiving the deterministic policy result, previewing the exact Pinch schedule and declining the invitation. Possession of the tokenised link alone must never authorise a live Pinch subscription mutation.
+- Before final customer confirmation can initiate cancellation and replacement, the customer must complete a separate one-time verification step. For the hackathon MVP the intended method is a one-time SMS code sent to a pre-existing trusted mobile number associated with the payer; the customer must not be able to enter, replace or update that number through the tokenised review flow.
+- The invitation link should be delivered through email or another channel separate from the SMS verification channel; if the same channel would provide both the link and the code, the case must not be treated as automatically verified without a separately approved control.
+- Successful verification must be bound server-side to the exact intervention, merchant, payer, subscription, selected date, current schedule, proposed schedule, amounts, policyVersion and confirmation attempt; any change to the selected date or the authoritative Pinch preview invalidates the earlier verification.
+- The code must be short-lived and single-use; verification attempts and resend requests must be rate-limited. Exact code length, expiry, attempt limits, resend limits, SMS provider and contact-data source remain subject to a separate inspection and explicit approval.
+- If no trusted mobile number is available, the code cannot be delivered, the code expires or verification fails, DueLogic must not execute automatically; the case moves to merchant review, escalation or another separately approved verified channel.
+- Routine requests that successfully pass policy evaluation, exact schedule review and transaction verification still require no later merchant approval.
+- A fresh Pinch preflight remains mandatory after successful verification and immediately before any mutation.
+- Stage 2 must reuse the existing protected confirmation, recovery and replacement path — never a second execution implementation.
+
 ## Outcome events
 
 The proven payment lifecycle events are:
