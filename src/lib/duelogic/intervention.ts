@@ -119,6 +119,16 @@ export interface DueLogicInterventionRecord {
   confirmationId: string | null;
   operationId: string | null;
   newSubscriptionId: string | null;
+  /**
+   * The movement kind an executed intervention completed through. Absent
+   * on records from before movement kinds existed (all permanent). The
+   * permanent path's confirmationId/operationId/newSubscriptionId
+   * semantics are unchanged; a temporary execution NEVER populates
+   * newSubscriptionId — the Pinch payment ID is retained instead.
+   */
+  executedMovementKind?: "temporary" | "permanent";
+  /** YYYY-MM-DD: the read-back-verified new date of a temporary movement. */
+  verifiedTemporaryTransactionDate?: string;
   status: InterventionEventStatus;
   /** ISO timestamps. */
   createdAt: string;

@@ -37,21 +37,16 @@ const OTP_CODE_DIGEST_CONTEXT = "duelogic-otp-code:v1";
 const OTP_MOBILE_FINGERPRINT_CONTEXT = "duelogic-otp-mobile:v1";
 
 /**
- * One immutable OTP challenge, bound to the exact intervention state the
- * customer saw when the code was requested. Deliberately absent: the
- * plaintext code, the complete mobile number, the review token and any
- * verificationId — none of those may ever live here.
+ * Fields shared by every OTP challenge regardless of the movement it
+ * covers. Deliberately absent: the plaintext code, the complete mobile
+ * number, the review token and any verificationId — none of those may
+ * ever live here.
  */
-export interface OtpChallengeRecord {
+interface OtpChallengeBase {
   readonly challengeId: string;
   readonly interventionId: string;
   readonly merchantId: string;
   readonly payerId: string;
-  readonly subscriptionId: string;
-  /** YYYY-MM-DD: the approved selected date this challenge covers. */
-  readonly selectedDate: string;
-  readonly currentPayments: readonly ConfirmedSchedulePayment[];
-  readonly proposedPayments: readonly ConfirmedSchedulePayment[];
   readonly policyVersion: string;
   /** HMAC-SHA256 fingerprint of the normalised trusted mobile. */
   readonly trustedMobileFingerprint: string;
@@ -67,13 +62,46 @@ export interface OtpChallengeRecord {
 }
 
 /**
- * The server-held values a usable challenge must still bind exactly at
- * verification time — the transaction-verification expectation plus the
- * trusted-mobile fingerprint. Any change to the intervention's selected
- * date, schedules, policy binding or the payer's trusted mobile makes the
- * outstanding challenge unusable.
+ * The permanent-replacement challenge: bound to the exact intervention
+ * state the customer saw when the code was requested — subscription,
+ * selected date and both exact three-payment schedules. `kind` may be
+ * absent on records stored before the discriminated model existed; those
+ * are treated as permanent.
  */
-export interface OtpChallengeExpectation {
+export interface PermanentOtpChallengeRecord extends OtpChallengeBase {
+  readonly kind?: "permanent";
+  readonly subscriptionId: string;
+  /** YYYY-MM-DD: the approved selected date this challenge covers. */
+  readonly selectedDate: string;
+  readonly currentPayments: readonly ConfirmedSchedulePayment[];
+  readonly proposedPayments: readonly ConfirmedSchedulePayment[];
+}
+
+/**
+ * The temporary-movement challenge: bound to one exact Pinch payment and
+ * its exact current and proposed state. Temporary data is never forced
+ * into replacement-schedule fields.
+ */
+export interface TemporaryOtpChallengeRecord extends OtpChallengeBase {
+  readonly kind: "temporary";
+  readonly paymentId: string;
+  readonly originalTransactionDate: string;
+  readonly proposedTransactionDate: string;
+  readonly amountInCents: number;
+}
+
+export type OtpChallengeRecord =
+  | PermanentOtpChallengeRecord
+  | TemporaryOtpChallengeRecord;
+
+/**
+ * The server-held values a usable challenge must still bind exactly at
+ * verification time — discriminated by movement kind, always including
+ * the trusted-mobile fingerprint. Any change to the bound operation state
+ * or the payer's trusted mobile makes the outstanding challenge unusable.
+ */
+export interface PermanentOtpChallengeExpectation {
+  kind?: "permanent";
   interventionId: string;
   merchantId: string;
   payerId: string;
@@ -84,6 +112,23 @@ export interface OtpChallengeExpectation {
   policyVersion: string;
   trustedMobileFingerprint: string;
 }
+
+export interface TemporaryOtpChallengeExpectation {
+  kind: "temporary";
+  interventionId: string;
+  merchantId: string;
+  payerId: string;
+  paymentId: string;
+  originalTransactionDate: string;
+  proposedTransactionDate: string;
+  amountInCents: number;
+  policyVersion: string;
+  trustedMobileFingerprint: string;
+}
+
+export type OtpChallengeExpectation =
+  | PermanentOtpChallengeExpectation
+  | TemporaryOtpChallengeExpectation;
 
 export type OtpChallengeEvaluation =
   | { ok: true }
@@ -168,9 +213,12 @@ export function otpDigestsEqual(aHex: string, bHex: string): boolean {
  * Pure usability evaluation of a stored challenge against the current
  * server-held expectation: not invalidated, not already used, unexpired
  * (against the supplied clock value — client time is never authoritative)
- * and bound exactly to the current intervention state and trusted-mobile
- * fingerprint. Any deviation refuses. Never reads a clock, never compares
- * code digests — the repository performs the timing-safe code comparison.
+ * and bound exactly — by movement kind — to the current operation state
+ * and trusted-mobile fingerprint. A kind mismatch refuses like any other
+ * binding deviation. Never reads a clock, never compares code digests —
+ * the repository performs the timing-safe code comparison. Records
+ * stored before the discriminated model carry no `kind` and are treated
+ * as permanent.
  */
 export function evaluateOtpChallenge(
   challenge: OtpChallengeRecord,
@@ -198,25 +246,77 @@ export function evaluateOtpChallenge(
   if (now >= expiresAt) {
     return { ok: false, reason: "expired" };
   }
-  const identityBindings: Array<[string, string]> = [
+
+  const challengeKind = challenge.kind ?? "permanent";
+  const expectedKind = expected.kind ?? "permanent";
+  if (challengeKind !== expectedKind) {
+    return { ok: false, reason: "mismatch" };
+  }
+
+  const sharedBindings: Array<[string, string]> = [
     [challenge.interventionId, expected.interventionId],
     [challenge.merchantId, expected.merchantId],
     [challenge.payerId, expected.payerId],
-    [challenge.subscriptionId, expected.subscriptionId],
-    [challenge.selectedDate, expected.selectedDate],
     [challenge.policyVersion, expected.policyVersion],
     [challenge.trustedMobileFingerprint, expected.trustedMobileFingerprint],
   ];
-  for (const [recorded, required] of identityBindings) {
+  for (const [recorded, required] of sharedBindings) {
+    if (recorded !== required || required.trim() === "") {
+      return { ok: false, reason: "mismatch" };
+    }
+  }
+
+  if (challengeKind === "temporary") {
+    const temporaryChallenge = challenge as TemporaryOtpChallengeRecord;
+    const temporaryExpected = expected as TemporaryOtpChallengeExpectation;
+    const temporaryBindings: Array<[string, string]> = [
+      [temporaryChallenge.paymentId, temporaryExpected.paymentId],
+      [
+        temporaryChallenge.originalTransactionDate,
+        temporaryExpected.originalTransactionDate,
+      ],
+      [
+        temporaryChallenge.proposedTransactionDate,
+        temporaryExpected.proposedTransactionDate,
+      ],
+    ];
+    for (const [recorded, required] of temporaryBindings) {
+      if (recorded !== required || required.trim() === "") {
+        return { ok: false, reason: "mismatch" };
+      }
+    }
+    if (
+      !Number.isInteger(temporaryExpected.amountInCents) ||
+      temporaryExpected.amountInCents <= 0 ||
+      temporaryChallenge.amountInCents !== temporaryExpected.amountInCents
+    ) {
+      return { ok: false, reason: "mismatch" };
+    }
+    return { ok: true };
+  }
+
+  const permanentChallenge = challenge as PermanentOtpChallengeRecord;
+  const permanentExpected = expected as PermanentOtpChallengeExpectation;
+  const permanentBindings: Array<[string, string]> = [
+    [permanentChallenge.subscriptionId, permanentExpected.subscriptionId],
+    [permanentChallenge.selectedDate, permanentExpected.selectedDate],
+  ];
+  for (const [recorded, required] of permanentBindings) {
     if (recorded !== required || required.trim() === "") {
       return { ok: false, reason: "mismatch" };
     }
   }
   if (
-    expected.currentPayments.length === 0 ||
-    expected.proposedPayments.length === 0 ||
-    !confirmedPaymentsEqual(challenge.currentPayments, expected.currentPayments) ||
-    !confirmedPaymentsEqual(challenge.proposedPayments, expected.proposedPayments)
+    permanentExpected.currentPayments.length === 0 ||
+    permanentExpected.proposedPayments.length === 0 ||
+    !confirmedPaymentsEqual(
+      permanentChallenge.currentPayments,
+      permanentExpected.currentPayments,
+    ) ||
+    !confirmedPaymentsEqual(
+      permanentChallenge.proposedPayments,
+      permanentExpected.proposedPayments,
+    )
   ) {
     return { ok: false, reason: "mismatch" };
   }

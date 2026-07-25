@@ -81,26 +81,28 @@ function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
 }
 
-/** Structural validity of a challenge before it may be stored. */
+/**
+ * Structural validity of a challenge before it may be stored, branched by
+ * movement kind (records without a kind are the permanent shape from
+ * before the discriminated model).
+ */
 function challengeDefect(record: OtpChallengeRecord): string | null {
   for (const key of Object.keys(record)) {
     if (key !== "codeDigest" && FORBIDDEN_CHALLENGE_KEY_PATTERN.test(key)) {
       return key;
     }
   }
-  const identityFields: Array<[string, unknown]> = [
+  const sharedFields: Array<[string, unknown]> = [
     ["challengeId", record.challengeId],
     ["interventionId", record.interventionId],
     ["merchantId", record.merchantId],
     ["payerId", record.payerId],
-    ["subscriptionId", record.subscriptionId],
-    ["selectedDate", record.selectedDate],
     ["policyVersion", record.policyVersion],
     ["trustedMobileFingerprint", record.trustedMobileFingerprint],
     ["maskedMobile", record.maskedMobile],
     ["codeDigest", record.codeDigest],
   ];
-  for (const [field, value] of identityFields) {
+  for (const [field, value] of sharedFields) {
     if (!nonEmpty(value)) {
       return field;
     }
@@ -112,6 +114,26 @@ function challengeDefect(record: OtpChallengeRecord): string | null {
   }
   if (record.verifiedAt !== null || record.invalidatedAt !== null) {
     return "lifecycle";
+  }
+
+  if (record.kind === "temporary") {
+    if (!nonEmpty(record.paymentId)) {
+      return "paymentId";
+    }
+    if (
+      !nonEmpty(record.originalTransactionDate) ||
+      !nonEmpty(record.proposedTransactionDate)
+    ) {
+      return "transactionDates";
+    }
+    if (!Number.isInteger(record.amountInCents) || record.amountInCents <= 0) {
+      return "amountInCents";
+    }
+    return null;
+  }
+
+  if (!nonEmpty(record.subscriptionId) || !nonEmpty(record.selectedDate)) {
+    return "subscription";
   }
   const schedulesValid = [record.currentPayments, record.proposedPayments].every(
     (payments) =>

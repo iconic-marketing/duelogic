@@ -266,6 +266,7 @@ export async function requestInterventionOtp(
   }
   const challengeId = deps.generateChallengeId();
   const challenge: OtpChallengeRecord = {
+    kind: "permanent",
     challengeId,
     interventionId: record.interventionId,
     merchantId: record.merchantId,
@@ -359,6 +360,7 @@ export async function verifyInterventionOtp(
   }
 
   const expectation: OtpChallengeExpectation = {
+    kind: "permanent",
     ...transactionVerificationExpectationFor(record),
     trustedMobileFingerprint: computeTrustedMobileFingerprint(
       secret,
