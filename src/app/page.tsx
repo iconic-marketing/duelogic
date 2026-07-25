@@ -1,19 +1,14 @@
 import Link from "next/link";
-import { addCalendarDays } from "@/lib/duelogic/calendar-date";
-import { detectTimingLinkedPatterns } from "@/lib/duelogic/pattern-detector";
+import { calculateMerchantOpportunity } from "@/lib/duelogic/merchant-opportunity";
+import { validateMerchantOpportunity } from "@/lib/duelogic/merchant-opportunity-validation";
 import {
   validateDetectionWindowSemantics,
   validateSeedPatternDetection,
 } from "@/lib/duelogic/pattern-detector-validation";
-import {
-  evaluateScheduleChange,
-  type PolicyDecision,
-  type TemporaryPolicyEvaluationRequest,
-} from "@/lib/duelogic/policy/engine";
 import { validatePlanScheduleResolver } from "@/lib/duelogic/policy/plan-schedule-validation";
 import { DEFAULT_DUELOGIC_POLICY } from "@/lib/duelogic/policy/rules";
 import { validatePolicyEngine } from "@/lib/duelogic/policy/validation";
-import type { Payer } from "@/lib/duelogic/schema";
+import { buildSeedPolicyEvaluations } from "@/lib/duelogic/seed-policy-evaluations";
 import {
   seedMerchant,
   seedPayers,
@@ -22,6 +17,7 @@ import {
 } from "@/lib/duelogic/seed-payment-history";
 import { validateCustomerConfirmationFlow } from "@/lib/pinch/customer-confirmation-validation";
 import { validateReplacementOperationRecovery } from "@/lib/pinch/replacement-operation-validation";
+import { MerchantOpportunityPanel } from "./merchant-opportunity-panel";
 import { MerchantSummary } from "./merchant-summary";
 import { PatternPanel } from "./pattern-panel";
 import { PaymentHistory } from "./payment-history";
@@ -30,44 +26,20 @@ import { ReplacementPanel } from "./replacement-panel";
 
 /**
  * The DueLogic merchant dashboard: one page over the frozen deterministic
- * capabilities. Sections 1-5 (summary, history, detected patterns, policy
- * decisions) are server-rendered from the synthetic seed, the detector and
- * the policy engine — no Pinch call, no clock read, no model output. The
- * live permanent-replacement journey is a client panel over the existing
- * localhost-only dev routes and fires nothing until its button is pressed.
+ * capabilities. Sections 1-6 (summary, opportunity, history, detected
+ * patterns, policy decisions) are server-rendered from the synthetic seed,
+ * the detector and the policy engine — no Pinch call, no clock read, no
+ * model output. The pattern flags and policy evaluations come from the
+ * shared seed-policy-evaluations builder, and the merchant opportunity
+ * panel aggregates those exact results — never a second evaluation
+ * pathway. The live permanent-replacement journey is a client panel over
+ * the existing localhost-only dev routes and fires nothing until its
+ * button is pressed.
  *
  * Following the dev-route convention, the deterministic validation suites
  * are re-asserted on every render; any regression fails the render loudly
  * rather than showing stale claims.
  */
-
-/**
- * The next scheduled debit after the seeded twelve months for each
- * intentionally planted pattern payer — explicit demonstration fixture data
- * (the seed is documented as one debit per payer per month), never inferred
- * at runtime from payment spacing. The requested date is derived from the
- * detector's own proposedShiftDays.
- */
-const NEXT_SEEDED_DEBITS: Readonly<
-  Record<string, { paymentId: string; currentPaymentDate: string; amountCents: number }>
-> = {
-  "payer-01": {
-    paymentId: "pay-p01-2026-07-upcoming",
-    currentPaymentDate: "2026-07-28",
-    amountCents: 12900,
-  },
-  "payer-02": {
-    paymentId: "pay-p02-2026-07-upcoming",
-    currentPaymentDate: "2026-07-27",
-    amountCents: 24950,
-  },
-};
-
-interface PolicyEvaluationItem {
-  payer: Payer;
-  request: TemporaryPolicyEvaluationRequest;
-  decision: PolicyDecision;
-}
 
 export default async function DashboardPage() {
   // Deterministic self-checks, re-asserted per render like the dev routes.
@@ -75,48 +47,34 @@ export default async function DashboardPage() {
   const seedValidation = validateSeedPatternDetection();
   const policyValidation = validatePolicyEngine();
   const planScheduleValidation = validatePlanScheduleResolver();
+  const opportunityValidation = validateMerchantOpportunity();
   const recoveryValidation = await validateReplacementOperationRecovery();
   const confirmationValidation = await validateCustomerConfirmationFlow();
 
-  const flags = detectTimingLinkedPatterns(seedPaymentRecords);
-  const payersById = new Map(seedPayers.map((payer) => [payer.id, payer]));
-
-  const flaggedItems = flags.flatMap((flag) => {
-    const payer = payersById.get(flag.payerId);
-    return payer === undefined ? [] : [{ payer, flag }];
+  const { flags, flaggedItems, policyItems } = buildSeedPolicyEvaluations();
+  const opportunity = calculateMerchantOpportunity({
+    payers: seedPayers,
+    flags,
+    evaluations: policyItems.map(({ request, decision }) => ({
+      request,
+      decision,
+    })),
   });
 
-  const policyItems: PolicyEvaluationItem[] = flaggedItems.flatMap(
-    ({ payer, flag }) => {
-      const nextDebit = NEXT_SEEDED_DEBITS[flag.payerId];
-      if (nextDebit === undefined) {
-        return [];
-      }
-      const requestedDate = addCalendarDays(
-        nextDebit.currentPaymentDate,
-        flag.proposedShiftDays,
-      );
-      if (requestedDate === null) {
-        return [];
-      }
-      const request: TemporaryPolicyEvaluationRequest = {
-        changeType: "temporary",
-        payerId: flag.payerId,
-        paymentId: nextDebit.paymentId,
-        amountCents: nextDebit.amountCents,
-        evaluationDate: seedSummary.lastScheduledDate,
-        currentArrearsCents: 0,
-        currentPaymentDate: nextDebit.currentPaymentDate,
-        requestedDate,
-      };
-      const decision = evaluateScheduleChange(
-        request,
-        [],
-        DEFAULT_DUELOGIC_POLICY,
-      );
-      return [{ payer, request, decision }];
-    },
-  );
+  // The frozen deterministic decision that governs the demonstrated
+  // permanent correction: the first approved evaluation in payer-ID order.
+  // Passed to the replacement panel as a narrow summary — the engine is
+  // never re-run in the client and no second policy pathway exists.
+  const approvedPolicyItem =
+    policyItems.find((item) => item.decision.outcome === "approved") ?? null;
+  const replacementPolicyDecision =
+    approvedPolicyItem === null
+      ? null
+      : {
+          outcome: approvedPolicyItem.decision.outcome,
+          reasonCode: approvedPolicyItem.decision.reasonCode,
+          policyVersion: approvedPolicyItem.decision.policyVersion,
+        };
 
   return (
     <main className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-10 font-sans text-sm">
@@ -149,13 +107,14 @@ export default async function DashboardPage() {
       </header>
 
       <MerchantSummary merchant={seedMerchant} summary={seedSummary} />
+      <MerchantOpportunityPanel result={opportunity} />
       <PaymentHistory items={flaggedItems} records={seedPaymentRecords} />
       <PatternPanel
         items={flaggedItems}
         asOfDate={seedSummary.lastScheduledDate}
       />
       <PolicyPanel items={policyItems} policy={DEFAULT_DUELOGIC_POLICY} />
-      <ReplacementPanel />
+      <ReplacementPanel policyDecision={replacementPolicyDecision} />
 
       <details className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
         <summary className="cursor-pointer font-medium">
@@ -172,6 +131,7 @@ export default async function DashboardPage() {
         detection ({seedValidation.flagCount} flags),{" "}
         {policyValidation.scenarioCount} policy-engine scenarios,{" "}
         {planScheduleValidation.scenarioCount} plan-schedule scenarios,{" "}
+        {opportunityValidation.scenarioCount} merchant-opportunity scenarios,{" "}
         {recoveryValidation.scenarioCount} recovery-operation scenarios,{" "}
         {confirmationValidation.scenarioCount} customer-confirmation
         scenarios.

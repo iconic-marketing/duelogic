@@ -7,26 +7,28 @@ import { ReplacementAudit } from "./replacement-audit";
 
 /**
  * Live permanent subscription replacement over the existing localhost-only
- * dev routes. The flow is strictly: fresh Pinch preview → gate checks →
- * server-recorded customer confirmation (a separate customer-facing page
- * accepts or declines the exact dates and amounts) → merchant execution
- * acknowledgement → exactly one call to the protected replacement route.
- * The merchant checkbox is an operator safeguard only — customer consent is
- * the server-held confirmation, which the replacement route independently
- * re-verifies and consumes. The demo identifiers come from a fixed fixture
- * and are never editable here; confirmed payments are always the live
- * preview's own dates and amounts, never generated locally; and an
- * execution attempt latches the controls off permanently — no retry is
- * ever issued, whatever the response.
+ * dev routes. The flow is strictly: frozen deterministic policy approval
+ * (passed in from the server render — merchant policy approval is
+ * automatic, never a manual step here) → fresh Pinch preview → gate checks
+ * → server-recorded customer confirmation (a separate customer-facing page
+ * accepts or declines the exact dates and amounts) → exactly one call to
+ * the protected replacement route. The execute button is an operational
+ * action, not a policy approval — customer consent is the server-held
+ * confirmation, which the replacement route independently re-verifies and
+ * consumes. The demo identifiers come from a fixed fixture and are never
+ * editable here; confirmed payments are always the live preview's own
+ * dates and amounts, never generated locally; and an execution attempt
+ * latches the controls off permanently — no retry is ever issued, whatever
+ * the response.
  */
 
 const FIXTURE = REPLACEMENT_DEMO_FIXTURE;
 
 /**
  * The existing backend confirmation contract. Submitted only after the
- * server reports an accepted customer confirmation AND the merchant selects
- * the visible acknowledgement — the phrase itself is the route's contract,
- * not a UI-invented control.
+ * server reports an accepted customer confirmation — the phrase itself is
+ * the route's contract, not a UI-invented control, and no server-side check
+ * is weakened by the client sending it.
  */
 const BACKEND_CONFIRMATION_PHRASE = "REPLACE FUTURE SCHEDULE";
 
@@ -503,7 +505,25 @@ function PaymentScheduleTable({
   );
 }
 
-export function ReplacementPanel() {
+/**
+ * Narrow view of the frozen deterministic policy decision the dashboard
+ * already renders. Passed in from the server render only — the policy
+ * engine is never re-run in the client and no second policy pathway
+ * exists. Merchant policy approval is automatic: an approved outcome here
+ * needs no manual merchant approval.
+ */
+export interface ReplacementPanelPolicyDecision {
+  outcome: string;
+  reasonCode: string;
+  policyVersion: string;
+}
+
+interface ReplacementPanelProps {
+  /** Null when no frozen decision exists; execution then stays disabled. */
+  policyDecision: ReplacementPanelPolicyDecision | null;
+}
+
+export function ReplacementPanel({ policyDecision }: ReplacementPanelProps) {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [preview, setPreview] = useState<LoadedPreview | null>(null);
@@ -517,7 +537,6 @@ export function ReplacementPanel() {
   );
   const [linkCopied, setLinkCopied] = useState(false);
 
-  const [acknowledged, setAcknowledged] = useState(false);
   /** Latched true at the first execution attempt and never reset. */
   const [executionStarted, setExecutionStarted] = useState(false);
   const [executing, setExecuting] = useState(false);
@@ -531,6 +550,48 @@ export function ReplacementPanel() {
   const customerAccepted = confirmationStatus === "accepted";
   const confirmationActive =
     confirmationStatus === "pending" || confirmationStatus === "accepted";
+  /** Automatic, deterministic — never a manual merchant step. */
+  const policyApproved = policyDecision?.outcome === "approved";
+  const readyToExecute =
+    policyApproved && previewValid && customerAccepted && !executionStarted;
+
+  const executionSequence: Array<{
+    label: string;
+    ok: boolean;
+    detail: string;
+  }> = [
+    {
+      label: "Policy approved automatically",
+      ok: policyApproved,
+      detail:
+        policyDecision === null
+          ? "no frozen policy decision was supplied — execution stays disabled"
+          : policyApproved
+            ? `${policyDecision.reasonCode} · policy ${policyDecision.policyVersion} — deterministic, no manual merchant approval`
+            : `deterministic outcome: ${policyDecision.outcome} (${policyDecision.reasonCode}) — execution stays disabled`,
+    },
+    {
+      label: "Live Pinch preview validated",
+      ok: previewValid,
+      detail: previewValid
+        ? "all pre-confirmation checks passed"
+        : "the live preview has not passed every pre-confirmation check",
+    },
+    {
+      label: "Customer confirmation received",
+      ok: customerAccepted,
+      detail: `server-held status: ${confirmationStatus ?? "none"}`,
+    },
+    {
+      label: "Ready to execute",
+      ok: readyToExecute,
+      detail: executionStarted
+        ? "execution has already been attempted — no retry will be issued"
+        : readyToExecute
+          ? "the request will be sent exactly once"
+          : "waiting on the steps above",
+    },
+  ];
 
   const loadPreview = async () => {
     if (previewLoading || executionStarted) {
@@ -539,7 +600,6 @@ export function ReplacementPanel() {
     setPreviewLoading(true);
     setPreviewError(null);
     setPreview(null);
-    setAcknowledged(false);
     try {
       const proposed = await fetchSchedulePreview(FIXTURE.proposedStartDate);
       if (proposed === null) {
@@ -716,7 +776,7 @@ export function ReplacementPanel() {
     if (
       executionStarted ||
       executing ||
-      !acknowledged ||
+      !policyApproved ||
       !customerAccepted ||
       confirmationId === null ||
       preview === null ||
@@ -778,16 +838,19 @@ export function ReplacementPanel() {
         </span>
       </div>
       <p className="mb-1 text-zinc-600 dark:text-zinc-400">
-        A permanent correction replaces the subscription: Pinch previews the
-        new schedule, the customer accepts the exact dates and amounts
-        through their own confirmation link, and only then is the protected
-        replacement route called — exactly once.
+        A permanent correction replaces the subscription: the deterministic
+        policy decision approves the change automatically under the
+        merchant&apos;s configured policy, Pinch previews the new schedule,
+        the customer accepts the exact dates and amounts through their own
+        confirmation link, and only then is the protected replacement route
+        called — exactly once.
       </p>
       <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-500">
-        A customer free-text request alone is never authority to change a
-        subscription, and a merchant checkbox is not customer consent — the
-        server-held confirmation record is. Everything below operates on a
-        real Pinch sandbox subscription; nothing is simulated.
+        Merchant policy approval is automatic — no manual merchant approval
+        is asked for. A customer free-text request alone is never authority
+        to change a subscription; the server-held confirmation record is the
+        customer&apos;s consent. Everything below operates on a real Pinch
+        sandbox subscription; nothing is simulated.
       </p>
 
       <dl className="mb-4 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
@@ -1049,66 +1112,40 @@ export function ReplacementPanel() {
                 confirmation is consumed by the attempt.
               </p>
               <ul className="mt-3 flex flex-col gap-1">
-                <li className="flex gap-2">
-                  <span
-                    className={
-                      customerAccepted
-                        ? "text-green-800 dark:text-green-400"
-                        : "font-medium text-red-700 dark:text-red-400"
-                    }
-                  >
-                    {customerAccepted ? "✓" : "✗"}
-                  </span>
-                  <span>
-                    Customer confirmation received (server-held status:{" "}
-                    {confirmationStatus ?? "none"})
-                  </span>
-                </li>
-                <li className="flex gap-2">
-                  <span
-                    className={
-                      acknowledged
-                        ? "text-green-800 dark:text-green-400"
-                        : "font-medium text-red-700 dark:text-red-400"
-                    }
-                  >
-                    {acknowledged ? "✓" : "✗"}
-                  </span>
-                  <span>Merchant execution acknowledgement</span>
-                </li>
+                {executionSequence.map((step) => (
+                  <li key={step.label} className="flex gap-2">
+                    <span
+                      className={
+                        step.ok
+                          ? "text-green-800 dark:text-green-400"
+                          : "font-medium text-red-700 dark:text-red-400"
+                      }
+                    >
+                      {step.ok ? "✓" : "✗"}
+                    </span>
+                    <span>
+                      {step.label}{" "}
+                      <span className="text-xs text-zinc-500 dark:text-zinc-500">
+                        — {step.detail}
+                      </span>
+                    </span>
+                  </li>
+                ))}
               </ul>
-              <label className="mt-3 flex items-start gap-2">
-                <input
-                  type="checkbox"
-                  className="mt-1"
-                  checked={acknowledged}
-                  onChange={(event) => setAcknowledged(event.target.checked)}
-                  disabled={executionStarted}
-                />
-                <span>
-                  As the operator, I acknowledge executing this permanent
-                  replacement now. (This is an operator safeguard — customer
-                  consent is the server-held confirmation above.)
-                </span>
-              </label>
               <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-500">
                 Rehearsal note: everything up to this point is safe — the
                 preview is read-only and the confirmation link mutates
                 nothing in Pinch. Pressing the button below executes the real
-                cancel-and-create sequence in the Pinch sandbox.
+                cancel-and-create sequence in the Pinch sandbox. It is an
+                operational action, not a policy approval.
               </p>
               <button
                 type="button"
-                className="mt-2 rounded bg-red-700 px-4 py-1.5 font-medium text-white disabled:opacity-50 dark:bg-red-500 dark:text-white"
+                className="mt-2 rounded bg-green-700 px-4 py-1.5 font-medium text-white disabled:bg-zinc-300 disabled:text-zinc-500 dark:bg-green-600 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500"
                 onClick={() => {
                   void executeReplacement();
                 }}
-                disabled={
-                  !acknowledged ||
-                  !customerAccepted ||
-                  executionStarted ||
-                  executing
-                }
+                disabled={!readyToExecute || executing}
               >
                 {executing
                   ? "Executing replacement…"

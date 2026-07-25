@@ -161,6 +161,13 @@ The webhook receiver:
 - Display the governing assumption beside the result, not in a footnote.
 - The model may interpret customer language, but deterministic code makes eligibility and execution decisions.
 
+## Merchant opportunity reporting
+
+- Merchant opportunity metrics (`src/lib/duelogic/merchant-opportunity.ts`) are derived only from detector output and the deterministic policy evaluations the dashboard already renders — never a second evaluation pathway.
+- Eligible value means upcoming payment value approved for schedule review under the displayed policy; it must never be described as prevented loss, recovered revenue or guaranteed success.
+- Unapproved cases (escalations and alternatives) remain visible in the detail rows but are excluded from approved-intervention counts and eligible-value totals.
+- A missing upcoming amount is a typed calculation error, never a silent zero.
+
 ## Policy and eligibility engine
 
 - The policy is declarative and versioned; all thresholds live in `DEFAULT_DUELOGIC_POLICY` (`src/lib/duelogic/policy/rules.ts`), and the engine always evaluates the supplied policy's values (e.g. `policy.amountCeilingCents`), so merchant-specific policies override defaults without engine changes.
