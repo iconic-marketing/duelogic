@@ -198,6 +198,15 @@ The webhook receiver:
 - The engine never uses the system clock and decides only — it never calls Pinch. Live Pinch status must be re-checked by the execution layer immediately before mutation; only a live payment with status `scheduled` may be changed.
 - Policy support for a cadence does not itself prove live Pinch execution support for that cadence.
 
+## Merchant policy snapshots
+
+- The default policy remains defined only in `DEFAULT_DUELOGIC_POLICY` (`src/lib/duelogic/policy/rules.ts`); the snapshot foundation never duplicates its values, and no policy rule may be added or changed without Renee's explicit approval.
+- A `MerchantPolicySnapshot` (`src/lib/duelogic/policy/policy-snapshot.ts`) is immutable, append-only activation history behind `MerchantPolicyRepository`: no update, delete or replace method exists, every write and read passes through `structuredClone`, and the latest successfully activated snapshot is the merchant's active policy.
+- `policyVersion` must equal `policy.version`; activation validates the complete policy through the engine's exported `assertValidPolicy` (never a duplicated check) and rejects duplicate versions and version mismatches without changing stored history.
+- The initial snapshot is `duelogic-default-v1`, installed automatically with `installedAsInitialDefault: true` when the shared development repository is first created, with `activatedAt` from the injected server clock; later development versions are server-generated `duelogic-policy-v{n}` (v2, v3, …).
+- The store (`src/lib/duelogic/policy/dev-policy-store.ts`) is process-local, non-durable sandbox memory that resets with the development process; durable storage replaces the repository implementation, not the snapshot or repository contract.
+- No consumer has been switched from the frozen policy yet: dashboard activation, historical-replay adoption, opportunity integration and intervention policy binding remain future controlled stages. The six-scenario suite (`policy-snapshot-validation.ts`) is re-asserted by the dashboard render.
+
 ## Plan-to-schedule configuration
 
 - The Pinch Plan and Subscription responses used by DueLogic do not currently provide a trusted cadence field.

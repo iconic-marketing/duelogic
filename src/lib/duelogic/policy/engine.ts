@@ -345,7 +345,7 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
-function assertValidPolicy(policy: DueLogicPolicy): void {
+export function assertValidPolicy(policy: DueLogicPolicy): void {
   const fail = (field: string): never =>
     invalid("INVALID_POLICY_VALUE", `Policy value ${field} is invalid.`);
 

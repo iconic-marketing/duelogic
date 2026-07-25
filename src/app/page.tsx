@@ -12,6 +12,7 @@ import {
   validateSeedPatternDetection,
 } from "@/lib/duelogic/pattern-detector-validation";
 import { validatePlanScheduleResolver } from "@/lib/duelogic/policy/plan-schedule-validation";
+import { validatePolicySnapshotFoundation } from "@/lib/duelogic/policy/policy-snapshot-validation";
 import { DEFAULT_DUELOGIC_POLICY } from "@/lib/duelogic/policy/rules";
 import { validatePolicyEngine } from "@/lib/duelogic/policy/validation";
 import { buildSeedPolicyEvaluations } from "@/lib/duelogic/seed-policy-evaluations";
@@ -58,6 +59,7 @@ export default async function DashboardPage() {
   const recoveryValidation = await validateReplacementOperationRecovery();
   const confirmationValidation = await validateCustomerConfirmationFlow();
   const interventionValidation = await validateInterventionFlow();
+  const policySnapshotValidation = await validatePolicySnapshotFoundation();
 
   // Stage 1 monitoring data from the process-local development store:
   // merchant-safe projections only — never token material and never the
@@ -160,7 +162,8 @@ export default async function DashboardPage() {
         {recoveryValidation.scenarioCount} recovery-operation scenarios,{" "}
         {confirmationValidation.scenarioCount} customer-confirmation
         scenarios, {interventionValidation.scenarioCount} customer-led
-        intervention scenarios.
+        intervention scenarios, {policySnapshotValidation.scenarioCount}{" "}
+        policy-snapshot scenarios.
       </footer>
     </main>
   );
