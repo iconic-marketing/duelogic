@@ -1,7 +1,12 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
 import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
-import { toCustomerInterventionProjection } from "@/lib/duelogic/intervention";
+import { getDevTransactionVerificationRepository } from "@/lib/duelogic/dev-transaction-verification-store";
+import {
+  toCustomerInterventionProjection,
+  type CustomerInterventionProjection,
+  type DueLogicInterventionRecord,
+} from "@/lib/duelogic/intervention";
 import { INTERVENTION_DEMO_FIXTURE } from "@/lib/duelogic/intervention-fixture";
 import { createInterventionPinchReadEffects } from "@/lib/duelogic/intervention-pinch-reads";
 import {
@@ -38,6 +43,28 @@ import {
  */
 
 export const runtime = "nodejs";
+
+/**
+ * Customer projection with the shared development verification state, so
+ * finalConfirmationEnabled reflects an available (rehearsal-seeded)
+ * verified record. This route only READS verification state — it can
+ * never create one. An unreadable store projects as no record.
+ */
+async function projectionWithVerification(
+  record: DueLogicInterventionRecord,
+  nowIso: string,
+): Promise<CustomerInterventionProjection> {
+  let verification = null;
+  try {
+    verification =
+      await getDevTransactionVerificationRepository().readVerifiedForIntervention(
+        record.interventionId,
+      );
+  } catch {
+    verification = null;
+  }
+  return toCustomerInterventionProjection(record, nowIso, verification);
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -127,7 +154,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({
           ok: true,
           changed: outcome.changed,
-          intervention: toCustomerInterventionProjection(
+          intervention: await projectionWithVerification(
             outcome.record,
             nowIso,
           ),
@@ -152,7 +179,7 @@ export async function POST(request: NextRequest) {
           stage: outcome.reason,
           ...(outcome.record !== undefined
             ? {
-                intervention: toCustomerInterventionProjection(
+                intervention: await projectionWithVerification(
                   outcome.record,
                   nowIso,
                 ),
@@ -182,7 +209,7 @@ export async function POST(request: NextRequest) {
     if (outcome.ok) {
       return NextResponse.json({
         ok: true,
-        intervention: toCustomerInterventionProjection(outcome.record, nowIso),
+        intervention: await projectionWithVerification(outcome.record, nowIso),
       });
     }
     if (outcome.reason === "not-found") {
@@ -202,7 +229,7 @@ export async function POST(request: NextRequest) {
         stage: outcome.reason,
         ...(outcome.record !== undefined
           ? {
-              intervention: toCustomerInterventionProjection(
+              intervention: await projectionWithVerification(
                 outcome.record,
                 nowIso,
               ),

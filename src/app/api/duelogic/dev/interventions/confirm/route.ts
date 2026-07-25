@@ -2,6 +2,8 @@ import { type NextRequest, NextResponse } from "next/server";
 import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
 import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
 import { toCustomerInterventionProjection } from "@/lib/duelogic/intervention";
+import { getDevTransactionVerificationRepository } from "@/lib/duelogic/dev-transaction-verification-store";
+import { transactionVerificationExpectationFor } from "@/lib/duelogic/intervention";
 import {
   confirmInterventionExecution,
   generateInterventionOperationId,
@@ -10,7 +12,6 @@ import {
   type InterventionReplacementPathRequest,
   type InterventionReplacementPathResult,
 } from "@/lib/duelogic/intervention-service";
-import { createEmptyDevTransactionVerificationRepository } from "@/lib/duelogic/transaction-verification";
 import { DEV_CUSTOMER_CONFIRMATION_LIFETIME_MINUTES } from "@/lib/pinch/customer-confirmation";
 import {
   generateCustomerConfirmationId,
@@ -22,15 +23,20 @@ import { getDevCustomerConfirmationRepository } from "@/lib/pinch/dev-customer-c
 /**
  * Stage 2 development endpoint: the customer's final confirmation on the
  * tokenised review page. Wiring only — and GATED: possession of the token
- * alone never reaches execution. The route first requires a valid verified
- * transaction-verification record bound to the exact intervention and
- * schedule (requireTransactionVerification); without one it refuses with
- * "verification-required", creating no confirmation, generating no
- * operation, calling no protected path and no Pinch endpoint, and changing
- * no intervention execution state. No write path for verification records
- * exists yet (the development repository is deliberately empty), so this
- * route currently always refuses; the later OTP stage creates the records
- * that satisfy the gate.
+ * alone never reaches execution. The route first performs the preliminary
+ * verification read (requireTransactionVerification, safe projection on
+ * refusal), then the AUTHORITATIVE atomic claim: the repository
+ * re-evaluates every bound field against the current stored intervention
+ * and consumes the verification single-use in one atomic operation. A
+ * failed claim — missing, expired, consumed, mismatched or a lost
+ * concurrent race — refuses with "verification-required", creating no
+ * confirmation, generating no operation, calling no internal execution
+ * function, no protected path and no Pinch endpoint. A claim is terminal:
+ * it is never rolled back, even when later execution refuses before any
+ * mutation, so a fresh verification is required for any later attempt.
+ * Records exist only through the controlled rehearsal seeding route today;
+ * the later OTP stage creates them through a verified code-entry path
+ * behind the same claim contract.
  *
  * Only after the gate passes does confirmInterventionExecution run, and
  * execution itself happens in the existing protected replacement route,
@@ -172,17 +178,17 @@ export async function POST(request: NextRequest) {
 
   try {
     const interventionRepository = getDevInterventionRepository();
+    const verifications = getDevTransactionVerificationRepository();
     const nowClock = () => new Date().toISOString();
 
-    // The mandatory transaction-verification gate. The development
-    // verification repository is deliberately empty (no write path exists
-    // anywhere), so this refuses every request today; execution below is
-    // reachable only once the later OTP stage creates verified records.
+    // Preliminary verification read: refuses early with a safe projection
+    // when no usable record exists. The atomic claim below remains the
+    // authoritative gate.
     const gate = await requireTransactionVerification(
       { token },
       {
         repository: interventionRepository,
-        verifications: createEmptyDevTransactionVerificationRepository(),
+        verifications,
         now: nowClock,
         hashToken: hashInterventionToken,
       },
@@ -207,6 +213,29 @@ export async function POST(request: NextRequest) {
                 ),
               }
             : {}),
+        },
+        { status: 409 },
+      );
+    }
+
+    // AUTHORITATIVE atomic claim: re-evaluates every bound field against
+    // the current stored intervention and consumes the verification
+    // single-use. Only a successful claim may reach the internal execution
+    // entry point, exactly once. Terminal: never rolled back.
+    const claimed = await verifications.claimForExecution(
+      gate.record.interventionId,
+      transactionVerificationExpectationFor(gate.record),
+      nowClock(),
+    );
+    if (claimed === null) {
+      return NextResponse.json(
+        {
+          ok: false,
+          stage: "verification-required",
+          intervention: toCustomerInterventionProjection(
+            gate.record,
+            nowClock(),
+          ),
         },
         { status: 409 },
       );

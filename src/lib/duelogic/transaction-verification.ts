@@ -9,12 +9,14 @@
  * needs — nothing more.
  *
  * Deliberately absent, by design: code generation, SMS delivery, code
- * entry, resend handling and any repository WRITE path. No verified record
- * can currently be created anywhere in the application, so the development
- * repository below always returns null and every execution gate refuses
- * today. The later OTP stage adds record creation and a real repository
- * implementation behind this same contract without changing
- * confirmInterventionExecution.
+ * entry, resend handling and customer contact data. Record creation exists
+ * only through the controlled development rehearsal surface
+ * (src/lib/duelogic/dev-transaction-verification-store.ts and its
+ * localhost-only seeding route) — the final SMS/OTP implementation will
+ * create records through a separate verified code-entry path behind the
+ * same claim contract, without changing confirmInterventionExecution. The
+ * empty repository below remains for validation and for any consumer that
+ * must prove gate behaviour with no record present.
  *
  * Pure data and functions only — no Pinch calls, no clock reads, no
  * storage, no token or code material of any kind.
@@ -54,12 +56,33 @@ export interface TransactionVerificationRecord {
 
 /**
  * Read-only storage boundary: the gate may only ask whether a verified
- * record exists for an intervention. No write, update, consume or delete
- * behaviour is defined here — the later OTP stage owns record lifecycle.
+ * record exists for an intervention. Reads return the stored record
+ * whether or not it has been consumed — callers evaluate usability through
+ * evaluateTransactionVerification.
  */
 export interface TransactionVerificationRepository {
   readVerifiedForIntervention(
     interventionId: string,
+  ): Promise<TransactionVerificationRecord | null>;
+}
+
+/**
+ * The write-and-claim contract the execution gate depends on. `create` is
+ * write-once per intervention; `claimForExecution` atomically re-evaluates
+ * every bound field against the supplied expectation and consumes the
+ * record single-use — a claim is terminal and is never rolled back, even
+ * when later execution refuses before any mutation. The controlled
+ * development rehearsal store implements this today; the final OTP
+ * implementation replaces only how records come to exist, keeping this
+ * claim and execution boundary unchanged.
+ */
+export interface ClaimableTransactionVerificationRepository
+  extends TransactionVerificationRepository {
+  create(record: TransactionVerificationRecord): Promise<void>;
+  claimForExecution(
+    interventionId: string,
+    expectation: TransactionVerificationExpectation,
+    nowIso: string,
   ): Promise<TransactionVerificationRecord | null>;
 }
 

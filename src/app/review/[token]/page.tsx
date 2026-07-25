@@ -7,7 +7,7 @@ import {
   hashInterventionToken,
   openIntervention,
 } from "@/lib/duelogic/intervention-service";
-import { createEmptyDevTransactionVerificationRepository } from "@/lib/duelogic/transaction-verification";
+import { getDevTransactionVerificationRepository } from "@/lib/duelogic/dev-transaction-verification-store";
 import { ReviewForm } from "./review-form";
 
 /**
@@ -68,14 +68,20 @@ export default async function CustomerReviewPage({
     );
   }
 
-  // Server-derived verification state. The development repository is
-  // deliberately empty (no write path exists), so this is always null
-  // today and finalConfirmationEnabled resolves false from the missing
-  // verified record — never from a hardcoded flag.
-  const verification =
-    await createEmptyDevTransactionVerificationRepository().readVerifiedForIntervention(
-      record.interventionId,
-    );
+  // Server-derived verification state from the shared development store.
+  // A record exists only after the controlled rehearsal seeding (or the
+  // future OTP path); otherwise this is null and finalConfirmationEnabled
+  // resolves false from the missing verified record — never a hardcoded
+  // flag, and never anything the browser supplies.
+  let verification = null;
+  try {
+    verification =
+      await getDevTransactionVerificationRepository().readVerifiedForIntervention(
+        record.interventionId,
+      );
+  } catch {
+    verification = null;
+  }
 
   const view = toCustomerInterventionProjection(
     record,

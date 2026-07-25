@@ -5,6 +5,7 @@ import {
   toMerchantInterventionProjection,
 } from "@/lib/duelogic/intervention";
 import { validateInterventionFlow } from "@/lib/duelogic/intervention-validation";
+import { validateTransactionVerification } from "@/lib/duelogic/transaction-verification-validation";
 import { calculateMerchantOpportunity } from "@/lib/duelogic/merchant-opportunity";
 import { validateMerchantOpportunity } from "@/lib/duelogic/merchant-opportunity-validation";
 import {
@@ -75,6 +76,7 @@ export default async function DashboardPage() {
   const confirmationValidation = await validateCustomerConfirmationFlow();
   const interventionValidation = await validateInterventionFlow();
   const policySnapshotValidation = await validatePolicySnapshotFoundation();
+  const verificationValidation = await validateTransactionVerification();
 
   // Merchant policy state from the process-local development store:
   // merchant-safe projections only reach the client panel. The active
@@ -207,7 +209,8 @@ export default async function DashboardPage() {
         {confirmationValidation.scenarioCount} customer-confirmation
         scenarios, {interventionValidation.scenarioCount} customer-led
         intervention scenarios, {policySnapshotValidation.scenarioCount}{" "}
-        policy-snapshot scenarios.
+        policy-snapshot scenarios, {verificationValidation.scenarioCount}{" "}
+        transaction-verification scenarios.
       </footer>
     </main>
   );

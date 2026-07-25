@@ -62,6 +62,18 @@
  * s20 a new invitation binds the newer active version while the earlier
  *     invitation keeps its own;
  * s21 policy binding leaves the transaction-verification gate closed.
+ *
+ * The atomic-claim scenarios (the dev confirmation route's composition —
+ * preliminary read gate, then the authoritative repository claim, then the
+ * internal execution function, with fakes only):
+ * s22 the atomic claim gates internal execution: a failed claim calls
+ *     nothing, a seeded claim consumes first and executes exactly once,
+ *     and a policy activation writes nothing to the verification store;
+ * s23 a pre-mutation internal refusal never restores the claimed
+ *     verification — claims are terminal and write-once seeding prevents
+ *     replacement;
+ * s24 a manual-recovery outcome retains the consumed verification as
+ *     evidence.
  */
 
 import {
@@ -72,6 +84,7 @@ import {
   effectiveInterventionStatus,
   toCustomerInterventionProjection,
   toMerchantInterventionProjection,
+  transactionVerificationExpectationFor,
   type DueLogicInterventionRecord,
   type DueLogicInterventionRepository,
   type InterventionNotificationRepository,
@@ -90,7 +103,12 @@ import {
   type InterventionScanDeps,
 } from "./intervention-service";
 import {
+  createInMemoryTransactionVerificationRepository,
+  seedRehearsalTransactionVerification,
+} from "./dev-transaction-verification-store";
+import {
   createEmptyDevTransactionVerificationRepository,
+  type ClaimableTransactionVerificationRepository,
   type TransactionVerificationRecord,
 } from "./transaction-verification";
 import { createInMemoryMerchantPolicyRepository } from "./policy/dev-policy-store";
@@ -1322,10 +1340,10 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // s15: the route-level transaction-verification gate refuses execution
   // when no valid verified record exists — the exact composition the dev
   // confirmation route uses: requireTransactionVerification first, and
-  // confirmInterventionExecution only on a passing gate. The empty
-  // development repository is the only implementation in the application
-  // (no write path exists anywhere), so token possession alone can never
-  // reach the internal function.
+  // confirmInterventionExecution only on a passing gate. Records exist
+  // only through the controlled rehearsal seeding surface (none exists
+  // here), so token possession alone can never reach the internal
+  // function.
   {
     const harness = await makeHarness();
     await toPreviewReady(harness);
@@ -1682,6 +1700,217 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       "s21: no internal execution call may occur in this stage",
     );
     record("s21-verification-gate-still-closed", "still-gated");
+  }
+
+  // Helpers for the atomic-claim scenarios: rehearsal seeding over the
+  // harness's own stores, and the dev confirmation route's exact
+  // composition — read the intervention, atomically claim, and only then
+  // call the internal execution function.
+  const seedVerificationFor = async (
+    harness: Harness,
+  ): Promise<ClaimableTransactionVerificationRepository> => {
+    const verifications = createInMemoryTransactionVerificationRepository();
+    const outcome = await seedRehearsalTransactionVerification(
+      { token: FIRST_RAW_TOKEN },
+      {
+        interventions: harness.repository,
+        verifications,
+        policies: harness.policies,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+        generateVerificationId: () => "ver_demo_01",
+      },
+    );
+    check(outcome.ok, "claim fixture: rehearsal seeding must succeed");
+    return verifications;
+  };
+  const claimThenExecute = async (
+    harness: Harness,
+    verifications: ClaimableTransactionVerificationRepository,
+    executionDeps: InterventionExecutionDeps,
+  ) => {
+    const stored = await harness.repository.readByTokenHash(
+      harness.tokenDeps.hashToken(FIRST_RAW_TOKEN),
+    );
+    check(stored !== null, "claim fixture: the invitation must resolve");
+    const current = stored as DueLogicInterventionRecord;
+    const claimed = await verifications.claimForExecution(
+      current.interventionId,
+      transactionVerificationExpectationFor(current),
+      harness.clock.now(),
+    );
+    if (claimed === null) {
+      return { claimed: null, outcome: null } as const;
+    }
+    return {
+      claimed,
+      outcome: await confirmInterventionExecution(
+        { token: FIRST_RAW_TOKEN },
+        executionDeps,
+      ),
+    } as const;
+  };
+
+  // s22: the atomic claim gates internal execution. Without a record the
+  // claim refuses and confirmInterventionExecution is never called; after
+  // the controlled rehearsal seeding the claim consumes FIRST and
+  // execution runs exactly once. A policy activation writes nothing to
+  // the verification store.
+  {
+    const harness = await makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const blocked = await claimThenExecute(
+      harness,
+      createInMemoryTransactionVerificationRepository(),
+      execution.deps,
+    );
+    check(
+      blocked.claimed === null && blocked.outcome === null,
+      "s22: a failed claim must not call confirmInterventionExecution",
+    );
+    check(
+      execution.pathCalls.length === 0 &&
+        execution.confirmationsCreated() === 0 &&
+        execution.operationsStarted() === 0,
+      "s22: the blocked path must invoke nothing",
+    );
+
+    const verifications = await seedVerificationFor(harness);
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, harness.clock.now()),
+    );
+    const interventionId = (await harness.repository.list())[0].interventionId;
+    const afterActivation =
+      await verifications.readVerifiedForIntervention(interventionId);
+    check(
+      afterActivation !== null && afterActivation.consumedAt === null,
+      "s22: a policy activation must neither create nor consume verification records",
+    );
+
+    const executed = await claimThenExecute(harness, verifications, execution.deps);
+    check(
+      executed.claimed !== null && executed.claimed.consumedAt !== null,
+      "s22: the claim must consume before execution",
+    );
+    check(
+      executed.outcome !== null &&
+        executed.outcome.ok &&
+        executed.outcome.record.status === "executed",
+      "s22: execution must run exactly once after a successful claim",
+    );
+    const reclaim = await verifications.claimForExecution(
+      interventionId,
+      transactionVerificationExpectationFor(
+        (await harness.repository.readById(
+          interventionId,
+        )) as DueLogicInterventionRecord,
+      ),
+      harness.clock.now(),
+    );
+    check(reclaim === null, "s22: the claim is single-use");
+    record("s22-claim-gates-internal-execution", "claim-first");
+  }
+
+  // s23: a pre-mutation internal refusal does NOT restore the claimed
+  // verification. Claims are terminal, and write-once seeding refuses a
+  // replacement — a fresh verification would require a new invitation.
+  {
+    const harness = await makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness);
+    const refusingDeps: InterventionExecutionDeps = {
+      ...execution.deps,
+      executeReplacementPath: async () => ({
+        kind: "refused",
+        stage: "confirmation-stale",
+      }),
+    };
+    const verifications = await seedVerificationFor(harness);
+    const result = await claimThenExecute(harness, verifications, refusingDeps);
+    check(
+      result.claimed !== null,
+      "s23: the claim must succeed before the refusal",
+    );
+    check(
+      result.outcome !== null &&
+        !result.outcome.ok &&
+        result.outcome.reason === "refused",
+      "s23: the internal path must refuse before any mutation",
+    );
+    const reverted = await harness.repository.readByTokenHash(
+      harness.tokenDeps.hashToken(FIRST_RAW_TOKEN),
+    );
+    check(
+      reverted !== null &&
+        reverted.status === "preview-ready" &&
+        reverted.confirmationId === null &&
+        reverted.operationId === null,
+      "s23: the refusal must revert the intervention with nothing external changed",
+    );
+    const storedVerification = await verifications.readVerifiedForIntervention(
+      (reverted as DueLogicInterventionRecord).interventionId,
+    );
+    check(
+      storedVerification !== null && storedVerification.consumedAt !== null,
+      "s23: the verification must remain consumed after the refusal",
+    );
+    const reclaim = await verifications.claimForExecution(
+      (reverted as DueLogicInterventionRecord).interventionId,
+      transactionVerificationExpectationFor(
+        reverted as DueLogicInterventionRecord,
+      ),
+      harness.clock.now(),
+    );
+    check(reclaim === null, "s23: no reclaim is possible — claims are terminal");
+    const reseed = await seedRehearsalTransactionVerification(
+      { token: FIRST_RAW_TOKEN },
+      {
+        interventions: harness.repository,
+        verifications,
+        policies: harness.policies,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+        generateVerificationId: () => "ver_demo_02",
+      },
+    );
+    check(
+      !reseed.ok && reseed.reason === "already-seeded",
+      "s23: write-once seeding must refuse replacing the consumed verification",
+    );
+    record("s23-refusal-keeps-claim-consumed", "terminal");
+  }
+
+  // s24: a manual-recovery outcome retains the consumed verification as
+  // evidence — no rollback, no reclaim, no re-execution.
+  {
+    const harness = await makeHarness();
+    await toPreviewReady(harness);
+    const execution = makeExecutionHarness(harness, { createFails: true });
+    const verifications = await seedVerificationFor(harness);
+    const result = await claimThenExecute(harness, verifications, execution.deps);
+    check(result.claimed !== null, "s24: the claim must succeed first");
+    check(
+      result.outcome !== null &&
+        !result.outcome.ok &&
+        result.outcome.reason === "manual-recovery-required",
+      "s24: the simulated post-cancellation failure must report manual recovery",
+    );
+    const stored = await harness.repository.readByTokenHash(
+      harness.tokenDeps.hashToken(FIRST_RAW_TOKEN),
+    );
+    check(
+      stored !== null && stored.status === "manual-recovery-required",
+      "s24: the intervention must record the manual-recovery state",
+    );
+    const storedVerification = await verifications.readVerifiedForIntervention(
+      (stored as DueLogicInterventionRecord).interventionId,
+    );
+    check(
+      storedVerification !== null && storedVerification.consumedAt !== null,
+      "s24: the consumed verification must be retained as evidence",
+    );
+    record("s24-failure-retains-consumed-verification", "evidence-retained");
   }
 
   return { scenarioCount: table.length, decisionTable: table };
