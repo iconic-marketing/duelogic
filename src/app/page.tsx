@@ -1,4 +1,10 @@
 import Link from "next/link";
+import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
+import {
+  summariseInterventions,
+  toMerchantInterventionProjection,
+} from "@/lib/duelogic/intervention";
+import { validateInterventionFlow } from "@/lib/duelogic/intervention-validation";
 import { calculateMerchantOpportunity } from "@/lib/duelogic/merchant-opportunity";
 import { validateMerchantOpportunity } from "@/lib/duelogic/merchant-opportunity-validation";
 import {
@@ -17,6 +23,7 @@ import {
 } from "@/lib/duelogic/seed-payment-history";
 import { validateCustomerConfirmationFlow } from "@/lib/pinch/customer-confirmation-validation";
 import { validateReplacementOperationRecovery } from "@/lib/pinch/replacement-operation-validation";
+import { InterventionPanel } from "./intervention-panel";
 import { MerchantOpportunityPanel } from "./merchant-opportunity-panel";
 import { MerchantSummary } from "./merchant-summary";
 import { PatternPanel } from "./pattern-panel";
@@ -50,6 +57,20 @@ export default async function DashboardPage() {
   const opportunityValidation = validateMerchantOpportunity();
   const recoveryValidation = await validateReplacementOperationRecovery();
   const confirmationValidation = await validateCustomerConfirmationFlow();
+  const interventionValidation = await validateInterventionFlow();
+
+  // Stage 1 monitoring data from the process-local development store:
+  // merchant-safe projections only — never token material and never the
+  // customer notification delivery artefacts.
+  const interventionNowIso = new Date().toISOString();
+  const interventionRecords = await getDevInterventionRepository().list();
+  const interventionSummary = summariseInterventions(
+    interventionRecords,
+    interventionNowIso,
+  );
+  const interventionProjections = interventionRecords.map((record) =>
+    toMerchantInterventionProjection(record, interventionNowIso),
+  );
 
   const { flags, flaggedItems, policyItems } = buildSeedPolicyEvaluations();
   const opportunity = calculateMerchantOpportunity({
@@ -115,6 +136,10 @@ export default async function DashboardPage() {
       />
       <PolicyPanel items={policyItems} policy={DEFAULT_DUELOGIC_POLICY} />
       <ReplacementPanel policyDecision={replacementPolicyDecision} />
+      <InterventionPanel
+        summary={interventionSummary}
+        interventions={interventionProjections}
+      />
 
       <details className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
         <summary className="cursor-pointer font-medium">
@@ -134,7 +159,8 @@ export default async function DashboardPage() {
         {opportunityValidation.scenarioCount} merchant-opportunity scenarios,{" "}
         {recoveryValidation.scenarioCount} recovery-operation scenarios,{" "}
         {confirmationValidation.scenarioCount} customer-confirmation
-        scenarios.
+        scenarios, {interventionValidation.scenarioCount} customer-led
+        intervention scenarios.
       </footer>
     </main>
   );

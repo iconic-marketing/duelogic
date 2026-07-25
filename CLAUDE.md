@@ -111,6 +111,18 @@ These are sandbox records. Reuse them when inspecting the proven integration. Do
 - The confirmation store (`src/lib/pinch/dev-customer-confirmation-store.ts`, behind `CustomerConfirmationRepository`) is process-local, non-durable sandbox memory; the deterministic suite lives in `customer-confirmation-validation.ts` and is re-asserted by the dev confirmation routes and the dashboard render.
 - Email/SMS link delivery and durable confirmation persistence are polish-week work, outside the Build Weekend scope.
 
+## Customer-led intervention flow (Stage 1)
+
+- Permanent recurring schedule correction remains central to the MVP: the merchant configures the flexibility policy once and it is applied automatically; ordinary approved requests require no case-by-case merchant approval.
+- Intervention invitations are generated automatically by the scheduled scan (dev trigger `POST /api/duelogic/dev/interventions/scan`, localhost-only): frozen detector evidence designates the opportunity, the frozen policy result must be approved, and the current active subscription is resolved read-only at runtime (`src/lib/duelogic/subscription-resolver.ts`) — never a hardcoded subscription ID, and an ambiguous or unreadable resolution is a development fixture error that creates no invitation.
+- The customer selects the date on the tokenised page `/review/[token]`; the existing deterministic policy engine evaluates it as a permanent change built entirely from server-held trusted data; Pinch calculates the authoritative schedule — preview dates are never generated or substituted locally, and exactly three current and three proposed Pinch-returned payments are stored at preview-ready.
+- No AI or natural-language interpretation is required for structured date selection, and no payday, income, employment, affordability or hardship inference is ever made.
+- Stage 1 stops at preview-ready: the "Confirm and apply this schedule" button is rendered disabled with no handler, and `confirmationId`, `operationId` and `newSubscriptionId` remain null. Final confirmation will initiate execution in Stage 2 through the existing protected replacement path — the existing replacement and recovery logic stays untouched and there is never an automatic retry after an ambiguous mutation.
+- The merchant monitors invitations and outcomes on the dashboard panel and handles escalations and manual-recovery cases; the monitoring projection never exposes the raw token, the token hash or the notification delivery artefact.
+- Intervention tokens follow the confirmation security pattern (256-bit, SHA-256 hash stored, never logged); the raw token exists only in the customer notification's review link, delivered through the in-app dev inbox `/dev/duelogic/inbox`.
+- The intervention flow lives in `src/lib/duelogic/intervention-service.ts` with injected repositories, clock, token functions and read-only Pinch effects (`intervention-pinch-reads.ts`, GET only); the store (`dev-intervention-store.ts`) is process-local, non-durable sandbox memory; the eight-scenario deterministic suite (`intervention-validation.ts`) never calls Pinch and is re-asserted by the scan route and the dashboard render.
+- A customer decline is terminal for the invitation: no further selection or preview, no Pinch call, no confirmation record.
+
 ## Outcome events
 
 The proven payment lifecycle events are:
