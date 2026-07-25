@@ -61,8 +61,12 @@ export interface InterventionDemoFixture {
 
 export const INTERVENTION_DEMO_FIXTURE: InterventionDemoFixture = {
   merchantId: "mch_gsz9TbadIKto3N",
-  payerId: "pyr_NEoNZK9KQTssSk",
-  sourceId: "src_Ak2GaZAGuRs51k",
+  // Clean OTP-rehearsal payer and source (Stage B): a fresh payer with no
+  // prior permanent-correction history. The previous demonstration payer
+  // consumed its rolling permanent allowance with the verified executed
+  // replacement, so it must not receive another routine invitation.
+  payerId: "pyr_A71RgcSwgUX6fX",
+  sourceId: "src_7TZedAtRpdDQTQ",
   planId: "pln_a1KGV4VGe75U5q",
   expectedRecurringAmountCents: 12500,
   scheduleCadence: "fortnightly",
