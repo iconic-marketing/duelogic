@@ -11,7 +11,12 @@ import {
   validateDetectionWindowSemantics,
   validateSeedPatternDetection,
 } from "@/lib/duelogic/pattern-detector-validation";
+import {
+  DEV_POLICY_MERCHANT_ID,
+  getDevMerchantPolicyRepository,
+} from "@/lib/duelogic/policy/dev-policy-store";
 import { validatePlanScheduleResolver } from "@/lib/duelogic/policy/plan-schedule-validation";
+import { buildMerchantPolicyView } from "@/lib/duelogic/policy/policy-activation";
 import { validatePolicySnapshotFoundation } from "@/lib/duelogic/policy/policy-snapshot-validation";
 import { DEFAULT_DUELOGIC_POLICY } from "@/lib/duelogic/policy/rules";
 import { validatePolicyEngine } from "@/lib/duelogic/policy/validation";
@@ -29,6 +34,7 @@ import { MerchantOpportunityPanel } from "./merchant-opportunity-panel";
 import { MerchantSummary } from "./merchant-summary";
 import { PatternPanel } from "./pattern-panel";
 import { PaymentHistory } from "./payment-history";
+import { PolicyConfigPanel } from "./policy-config-panel";
 import { PolicyPanel } from "./policy-panel";
 import { ReplacementPanel } from "./replacement-panel";
 
@@ -60,6 +66,16 @@ export default async function DashboardPage() {
   const confirmationValidation = await validateCustomerConfirmationFlow();
   const interventionValidation = await validateInterventionFlow();
   const policySnapshotValidation = await validatePolicySnapshotFoundation();
+
+  // Merchant policy configuration state from the process-local development
+  // store: merchant-safe projections only reach the client panel. Every
+  // consumer below still evaluates under the frozen DEFAULT_DUELOGIC_POLICY
+  // — adoption of activated snapshots is a later controlled stage.
+  const policyRepository = await getDevMerchantPolicyRepository();
+  const policyView = await buildMerchantPolicyView(
+    policyRepository,
+    DEV_POLICY_MERCHANT_ID,
+  );
 
   // Stage 1 monitoring data from the process-local development store:
   // merchant-safe projections only — never token material and never the
@@ -137,6 +153,10 @@ export default async function DashboardPage() {
         asOfDate={seedSummary.lastScheduledDate}
       />
       <PolicyPanel items={policyItems} policy={DEFAULT_DUELOGIC_POLICY} />
+      <PolicyConfigPanel
+        initialActive={policyView.active}
+        initialHistory={policyView.history}
+      />
       <ReplacementPanel policyDecision={replacementPolicyDecision} />
       <InterventionPanel
         summary={interventionSummary}

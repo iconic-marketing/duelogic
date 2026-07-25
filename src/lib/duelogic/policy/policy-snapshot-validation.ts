@@ -24,9 +24,26 @@
  *     never alters stored state;
  *  s6 multiple activations create distinct sequential versions, retain
  *     all earlier snapshots and leave only the latest active.
+ *
+ * The dashboard configuration stage adds seven scenarios over the
+ * activation request helper (policy-activation.ts):
+ *  s7 the merchant-safe view exposes the active projection and ordered
+ *     history without the merchant ID or any complete policy data;
+ *  s8 a valid ceiling activates the next server-generated immutable
+ *     version, changing only policy.version, amountCeilingCents and
+ *     snapshot metadata, with the initial default retained in history;
+ *  s9 unknown keys and browser-supplied policy identity or fixed rule
+ *     fields are rejected without a repository write;
+ * s10 invalid ceiling values are rejected without changing history;
+ * s11 consecutive request-path activations create sequential versions and
+ *     preserve every earlier snapshot;
+ * s12 the returned safe view cannot be mutated to change stored state;
+ * s13 the frozen seed policy consumers still evaluate under the default
+ *     policy version after an activation.
  */
 
 import type { DueLogicPolicy } from "../schema";
+import { buildSeedPolicyEvaluations } from "../seed-policy-evaluations";
 import {
   createInMemoryMerchantPolicyRepository,
   DEV_POLICY_MERCHANT_ID,
@@ -34,6 +51,10 @@ import {
   installInitialDefaultPolicySnapshot,
 } from "./dev-policy-store";
 import { PolicyValidationError } from "./engine";
+import {
+  buildMerchantPolicyView,
+  processPolicyActivationRequest,
+} from "./policy-activation";
 import type {
   MerchantPolicyRepository,
   MerchantPolicySnapshot,
@@ -375,7 +396,274 @@ export async function validatePolicySnapshotFoundation(): Promise<PolicySnapshot
     record("s6-multiple-activations-sequential", "append-only");
   }
 
-  check(table.length === 6, `expected 6 scenarios, produced ${table.length}`);
+  // s7: the merchant-safe view exposes the active projection and the full
+  // ordered history, with no merchant ID, no complete policy object, no
+  // fixed rule internals and no repository detail.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    await repository.activate(laterSnapshot("duelogic-policy-v2", clock()));
+    const view = await buildMerchantPolicyView(
+      repository,
+      DEV_POLICY_MERCHANT_ID,
+    );
+    check(
+      view.active !== null &&
+        view.active.policyVersion === "duelogic-policy-v2" &&
+        view.active.amountCeilingCents === 60_000,
+      "s7: the view must expose the active snapshot projection",
+    );
+    check(
+      view.history.length === 2 &&
+        view.history[0].policyVersion === "duelogic-default-v1" &&
+        view.history[1].policyVersion === "duelogic-policy-v2",
+      "s7: the view history must preserve activation order",
+    );
+    const json = JSON.stringify(view);
+    check(
+      !json.includes(DEV_POLICY_MERCHANT_ID),
+      "s7: the view must not contain the merchant ID",
+    );
+    check(
+      !json.includes("temporaryChange") &&
+        !json.includes("permanentChange") &&
+        !json.includes("supportedCadences") &&
+        !json.includes("arrears") &&
+        !json.includes("\"policy\""),
+      "s7: the view must not contain the complete policy object or fixed rule internals",
+    );
+    check(
+      view.history.every((entry) => Object.keys(entry).length === 4),
+      "s7: projections must carry exactly the four merchant-safe fields",
+    );
+    record("s7-merchant-safe-view", "safe");
+  }
+
+  // s8: a valid ceiling through the request path activates the next
+  // server-generated immutable version; only policy.version,
+  // amountCeilingCents and snapshot metadata differ from the fixed default
+  // frame, and the initial default remains in history.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const outcome = await processPolicyActivationRequest(
+      { amountCeilingCents: 75_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    check(outcome.ok, "s8: a valid ceiling must activate");
+    const view = outcome.ok ? outcome.view : null;
+    check(
+      view !== null &&
+        view.active !== null &&
+        view.active.policyVersion === "duelogic-policy-v2" &&
+        view.active.amountCeilingCents === 75_000 &&
+        view.active.installedAsInitialDefault === false,
+      "s8: the next server-generated version must become active",
+    );
+    const active = await repository.readActive(DEV_POLICY_MERCHANT_ID);
+    check(
+      active !== null &&
+        JSON.stringify({
+          ...active.policy,
+          version: DEFAULT_DUELOGIC_POLICY.version,
+          amountCeilingCents: DEFAULT_DUELOGIC_POLICY.amountCeilingCents,
+        }) === JSON.stringify(DEFAULT_DUELOGIC_POLICY),
+      "s8: only policy.version and amountCeilingCents may differ from the fixed default frame",
+    );
+    check(
+      active !== null && active.policyVersion === active.policy.version,
+      "s8: the snapshot metadata must stay version-consistent",
+    );
+    check(
+      (await repository.readByVersion(
+        DEV_POLICY_MERCHANT_ID,
+        "duelogic-default-v1",
+      )) !== null,
+      "s8: the initial default must remain in history after activation",
+    );
+    record("s8-activation-request-creates-next-version", "activated");
+  }
+
+  // s9: unknown keys — including browser-supplied policyVersion, version,
+  // merchantId, activatedAt, installedAsInitialDefault and fixed policy
+  // fields — and non-object bodies are rejected without a repository write.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const before = JSON.stringify(await repository.list(DEV_POLICY_MERCHANT_ID));
+    const rejectedInputs: unknown[] = [
+      { amountCeilingCents: 75_000, policyVersion: "duelogic-policy-v9" },
+      { amountCeilingCents: 75_000, version: "duelogic-policy-v9" },
+      { amountCeilingCents: 75_000, merchantId: "mch_other" },
+      { amountCeilingCents: 75_000, activatedAt: "2026-01-01T00:00:00.000Z" },
+      { amountCeilingCents: 75_000, installedAsInitialDefault: true },
+      { amountCeilingCents: 75_000, temporaryChange: { maxShiftDays: 30 } },
+      { amountCeilingCents: 75_000, arrears: { action: "approve" } },
+      {},
+      "75000",
+      75_000,
+      null,
+      [75_000],
+    ];
+    for (const input of rejectedInputs) {
+      const outcome = await processPolicyActivationRequest(input, {
+        repository,
+        merchantId: DEV_POLICY_MERCHANT_ID,
+        now: clock,
+      });
+      check(
+        !outcome.ok && outcome.stage === "validation",
+        "s9: browser-supplied identity, fixed fields and unknown keys must be rejected",
+      );
+    }
+    check(
+      JSON.stringify(await repository.list(DEV_POLICY_MERCHANT_ID)) === before,
+      "s9: rejected inputs must not change the repository",
+    );
+    record("s9-browser-identity-and-unknown-keys-rejected", "rejected");
+  }
+
+  // s10: invalid ceiling values — missing, boolean, string, decimal, zero,
+  // negative and unsafe numbers — are rejected without changing history.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const before = JSON.stringify(await repository.list(DEV_POLICY_MERCHANT_ID));
+    const invalidCeilings: unknown[] = [
+      undefined,
+      true,
+      false,
+      "50000",
+      500.5,
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      2 ** 53,
+      null,
+    ];
+    for (const value of invalidCeilings) {
+      const outcome = await processPolicyActivationRequest(
+        { amountCeilingCents: value },
+        { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+      );
+      check(
+        !outcome.ok && outcome.stage === "validation",
+        "s10: an invalid ceiling value must be rejected",
+      );
+    }
+    check(
+      JSON.stringify(await repository.list(DEV_POLICY_MERCHANT_ID)) === before,
+      "s10: rejected ceiling values must not change the repository",
+    );
+    record("s10-invalid-ceilings-rejected", "rejected-unchanged");
+  }
+
+  // s11: consecutive request-path activations create sequential
+  // server-generated versions and preserve every earlier snapshot.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const versions: string[] = [];
+    for (const ceiling of [60_000, 70_000, 80_000]) {
+      const outcome = await processPolicyActivationRequest(
+        { amountCeilingCents: ceiling },
+        { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+      );
+      check(outcome.ok, "s11: each valid activation must succeed");
+      if (outcome.ok && outcome.view.active !== null) {
+        versions.push(outcome.view.active.policyVersion);
+      }
+    }
+    check(
+      JSON.stringify(versions) ===
+        JSON.stringify([
+          "duelogic-policy-v2",
+          "duelogic-policy-v3",
+          "duelogic-policy-v4",
+        ]),
+      "s11: consecutive activations must create sequential versions",
+    );
+    const history = await repository.list(DEV_POLICY_MERCHANT_ID);
+    check(
+      history.length === 4 &&
+        JSON.stringify(history.map((entry) => entry.policy.amountCeilingCents)) ===
+          JSON.stringify([
+            DEFAULT_DUELOGIC_POLICY.amountCeilingCents,
+            60_000,
+            70_000,
+            80_000,
+          ]),
+      "s11: every earlier snapshot must be preserved with its own ceiling",
+    );
+    record("s11-consecutive-activations-sequential", "sequential");
+  }
+
+  // s12: mutating the returned safe view never changes stored state.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const outcome = await processPolicyActivationRequest(
+      { amountCeilingCents: 75_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    check(outcome.ok, "s12: the fixture activation must succeed");
+    const storedBefore = JSON.stringify(
+      await repository.list(DEV_POLICY_MERCHANT_ID),
+    );
+    const view = await buildMerchantPolicyView(
+      repository,
+      DEV_POLICY_MERCHANT_ID,
+    );
+    check(view.active !== null, "s12: the view must expose an active snapshot");
+    (view.active as { amountCeilingCents: number }).amountCeilingCents = 1;
+    (view.history[0] as { policyVersion: string }).policyVersion = "tampered";
+    view.history.pop();
+    check(
+      JSON.stringify(await repository.list(DEV_POLICY_MERCHANT_ID)) ===
+        storedBefore,
+      "s12: mutating the returned view must not alter stored state",
+    );
+    const reread = await buildMerchantPolicyView(
+      repository,
+      DEV_POLICY_MERCHANT_ID,
+    );
+    check(
+      reread.active !== null &&
+        reread.active.policyVersion === "duelogic-policy-v2" &&
+        reread.active.amountCeilingCents === 75_000 &&
+        reread.history.length === 2 &&
+        reread.history[0].policyVersion === "duelogic-default-v1",
+      "s12: a fresh view must show the untouched stored state",
+    );
+    record("s12-safe-view-immutable", "immutable");
+  }
+
+  // s13: no policy consumer changed in this stage — after an activation,
+  // the frozen seed policy evaluations (the source of the replay,
+  // opportunity and intervention figures) still carry the default policy
+  // version.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const outcome = await processPolicyActivationRequest(
+      { amountCeilingCents: 90_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    check(outcome.ok, "s13: the fixture activation must succeed");
+    const { policyItems } = buildSeedPolicyEvaluations();
+    check(
+      policyItems.length > 0 &&
+        policyItems.every(
+          (item) =>
+            item.decision.policyVersion === DEFAULT_DUELOGIC_POLICY.version,
+        ),
+      "s13: the frozen policy consumers must still evaluate under the default policy version",
+    );
+    record("s13-consumers-remain-frozen", "frozen");
+  }
+
+  check(table.length === 13, `expected 13 scenarios, produced ${table.length}`);
   return { scenarioCount: table.length, decisionTable: table };
 }
 
