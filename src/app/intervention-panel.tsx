@@ -114,10 +114,13 @@ export function InterventionPanel({
       </div>
       <p className="mb-4 text-zinc-600 dark:text-zinc-400">
         Invitations are generated automatically for qualifying timing-linked
-        patterns under the configured policy. The customer selects the date;
-        deterministic code evaluates it; Pinch calculates the authoritative
-        schedule. Ordinary eligible requests need no case-by-case merchant
-        approval — escalations and exceptions appear here.
+        patterns under the merchant policy active at creation, and each
+        invitation stays bound to that policy version for its whole life.
+        The customer selects the date; deterministic code evaluates it under
+        the bound version; Pinch calculates the authoritative schedule.
+        Ordinary eligible requests need no case-by-case merchant approval —
+        escalations and exceptions appear here. Final execution remains
+        gated by customer transaction verification.
       </p>
 
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
@@ -141,6 +144,7 @@ export function InterventionPanel({
               <tr className="border-b border-zinc-200 text-xs text-zinc-500 dark:border-zinc-800">
                 <th className="py-1.5 pr-4 font-medium">Intervention</th>
                 <th className="py-1.5 pr-4 font-medium">Status</th>
+                <th className="py-1.5 pr-4 font-medium">Bound policy</th>
                 <th className="py-1.5 pr-4 font-medium">Suggested date</th>
                 <th className="py-1.5 pr-4 font-medium">Selected date</th>
                 <th className="py-1.5 font-medium">Policy outcome</th>
@@ -157,6 +161,9 @@ export function InterventionPanel({
                   </td>
                   <td className="py-1.5 pr-4 font-medium">
                     {intervention.status}
+                  </td>
+                  <td className="py-1.5 pr-4 font-mono text-xs">
+                    {intervention.policyVersion}
                   </td>
                   <td className="py-1.5 pr-4">{intervention.suggestedDate}</td>
                   <td className="py-1.5 pr-4">

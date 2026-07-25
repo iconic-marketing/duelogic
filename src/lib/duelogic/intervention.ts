@@ -75,6 +75,11 @@ export interface DueLogicInterventionRecord {
   planId: string;
   /** The detector flag that qualified this opportunity. */
   patternFlagId: string;
+  /**
+   * The saved merchant policy version bound at creation — authoritative
+   * for every later evaluation on this intervention. A later policy
+   * activation never alters it.
+   */
   policyVersion: string;
   scheduleCadence: SupportedScheduleCadence;
   /** Stage 1 issues permanent-change invitations only. */
@@ -337,6 +342,8 @@ export interface MerchantInterventionProjection {
   subscriptionId: string;
   planId: string;
   status: InterventionStatus;
+  /** The saved policy version bound to this intervention at creation. */
+  policyVersion: string;
   suggestedDate: string;
   selectedDate: string | null;
   policyOutcome: "approved" | "next-cycle-alternative" | "escalate" | null;
@@ -360,6 +367,7 @@ export function toMerchantInterventionProjection(
     subscriptionId: record.subscriptionId,
     planId: record.planId,
     status: effectiveInterventionStatus(record, nowIso),
+    policyVersion: record.policyVersion,
     suggestedDate: record.suggestedDate,
     selectedDate: record.selectedDate,
     policyOutcome: record.policyOutcome,

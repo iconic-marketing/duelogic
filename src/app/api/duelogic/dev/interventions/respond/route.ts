@@ -9,6 +9,7 @@ import {
   evaluateSelectedDate,
   hashInterventionToken,
 } from "@/lib/duelogic/intervention-service";
+import { getDevMerchantPolicyRepository } from "@/lib/duelogic/policy/dev-policy-store";
 import {
   PinchApiError,
   PinchAuthError,
@@ -167,6 +168,10 @@ export async function POST(request: NextRequest) {
       INTERVENTION_DEMO_FIXTURE,
       {
         repository,
+        // The saved policy store: evaluation resolves the intervention's
+        // stored policyVersion — never the currently active policy, and
+        // never anything browser-supplied.
+        policies: await getDevMerchantPolicyRepository(),
         now: () => new Date().toISOString(),
         hashToken: hashInterventionToken,
         previewReads: createInterventionPinchReadEffects(

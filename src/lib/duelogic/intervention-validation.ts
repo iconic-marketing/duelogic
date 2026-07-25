@@ -48,6 +48,20 @@
  *     no valid verified record exists: the internal function is never
  *     called, and no confirmation, operation, execution state or
  *     replacement dependency is touched.
+ *
+ * The policy-binding scenarios (every harness carries an isolated saved-
+ * policy store with the frozen default pre-installed):
+ * s16 the scan resolves and binds the active saved policy, and refuses
+ *     with no invitation when none resolves or its ceiling forbids;
+ * s17 a pending invitation stays bound to its creation-time version after
+ *     a later activation;
+ * s18 the stored version — not the currently active one — determines the
+ *     customer evaluation outcome, in both directions;
+ * s19 an unresolvable bound version refuses safely: no preview read, no
+ *     execution state, no fallback to the active or frozen policy;
+ * s20 a new invitation binds the newer active version while the earlier
+ *     invitation keeps its own;
+ * s21 policy binding leaves the transaction-verification gate closed.
  */
 
 import {
@@ -79,6 +93,12 @@ import {
   createEmptyDevTransactionVerificationRepository,
   type TransactionVerificationRecord,
 } from "./transaction-verification";
+import { createInMemoryMerchantPolicyRepository } from "./policy/dev-policy-store";
+import type {
+  MerchantPolicyRepository,
+  MerchantPolicySnapshot,
+} from "./policy/policy-snapshot";
+import { DEFAULT_DUELOGIC_POLICY } from "./policy/rules";
 import { addCalendarDays } from "./calendar-date";
 import type {
   SubscriptionDetailSnapshot,
@@ -263,27 +283,65 @@ interface Harness {
   tokenDeps: ReturnType<typeof makeTokenDeps>;
   scanDeps: InterventionScanDeps;
   subscriptionCalls: string[];
+  /** Isolated saved-policy store; the frozen default is pre-installed. */
+  policies: MerchantPolicyRepository;
 }
 
-function makeHarness(
+/**
+ * A later saved-policy snapshot for the demo merchant: the frozen default
+ * frame with only the version and ceiling changed — never a new rule.
+ */
+function policySnapshotFor(
+  policyVersion: string,
+  amountCeilingCents: number,
+  activatedAt: string,
+): MerchantPolicySnapshot {
+  return {
+    policyVersion,
+    merchantId: DEMO_FIXTURE.merchantId,
+    policy: { ...DEFAULT_DUELOGIC_POLICY, version: policyVersion, amountCeilingCents },
+    activatedAt,
+    installedAsInitialDefault: false,
+  };
+}
+
+async function makeHarness(
   clockStart: string = SCAN_CLOCK_START,
   subscriptions: SubscriptionDetailSnapshot[] = [demoSubscription()],
-): Harness {
+  policies?: MerchantPolicyRepository,
+): Promise<Harness> {
   const repository = createInMemoryInterventionRepository();
   const notifications = createInMemoryInterventionNotificationRepository();
   const clock = makeClock(clockStart);
   const tokenDeps = makeTokenDeps();
   const reads = makeSubscriptionReads(subscriptions);
+  const policyRepository =
+    policies ?? createInMemoryMerchantPolicyRepository();
+  // Pre-install the frozen default as the initial active snapshot for the
+  // demo merchant, mirroring the shared development repository's
+  // first-creation behaviour. Skipped when a supplied shared store already
+  // holds history.
+  if ((await policyRepository.list(DEMO_FIXTURE.merchantId)).length === 0) {
+    await policyRepository.activate({
+      policyVersion: DEFAULT_DUELOGIC_POLICY.version,
+      merchantId: DEMO_FIXTURE.merchantId,
+      policy: DEFAULT_DUELOGIC_POLICY,
+      activatedAt: clock.now(),
+      installedAsInitialDefault: true,
+    });
+  }
   return {
     repository,
     notifications,
     clock,
     tokenDeps,
     subscriptionCalls: reads.calls,
+    policies: policyRepository,
     scanDeps: {
       repository,
       notifications,
       subscriptionReads: reads.effects,
+      policies: policyRepository,
       now: clock.now,
       ...tokenDeps,
       invitationLifetimeMinutes: 30,
@@ -319,6 +377,7 @@ async function toPreviewReady(
     DEMO_FIXTURE,
     {
       repository: harness.repository,
+      policies: harness.policies,
       now: harness.clock.now,
       hashToken: harness.tokenDeps.hashToken,
       previewReads: preview.effects,
@@ -571,7 +630,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // the trusted cycle, holding only the token hash, with the raw token
   // present only in the notification delivery artefact.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const created = await scanCreated(harness);
     check(
       created.subscriptionId === "sub_demo_active",
@@ -627,7 +686,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // s2: a second scan run does not create a duplicate active invitation for
   // the same subscription — repeated clicks return the existing invitation.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const created = await scanCreated(harness);
     const second = await runScheduledInterventionScan(
       DEMO_FIXTURE,
@@ -654,7 +713,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // s3: an expired invitation cannot select a date; the refusal happens
   // before any policy evaluation or preview read.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const created = await scanCreated(harness);
     harness.clock.advanceMinutes(31);
     const preview = makePreviewReads(demoSubscription());
@@ -663,6 +722,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       DEMO_FIXTURE,
       {
         repository: harness.repository,
+        policies: harness.policies,
         now: harness.clock.now,
         hashToken: harness.tokenDeps.hashToken,
         previewReads: preview.effects,
@@ -690,7 +750,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // s4: an approved selected date proceeds to the mocked read-only Pinch
   // preview and stores the exact returned current and proposed schedules.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const created = await scanCreated(harness);
     const preview = makePreviewReads(demoSubscription());
     const outcome = await evaluateSelectedDate(
@@ -698,6 +758,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       DEMO_FIXTURE,
       {
         repository: harness.repository,
+        policies: harness.policies,
         now: harness.clock.now,
         hashToken: harness.tokenDeps.hashToken,
         previewReads: preview.effects,
@@ -742,11 +803,12 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   {
     // Later clock: the invitation is created and evaluated on 2026-08-13,
     // so an in-cycle date at or before the evaluation date is unavailable.
-    const harness = makeHarness("2026-08-13T00:00:00.000Z");
+    const harness = await makeHarness("2026-08-13T00:00:00.000Z");
     await scanCreated(harness);
     const preview = makePreviewReads(demoSubscription());
     const deps = {
       repository: harness.repository,
+      policies: harness.policies,
       now: harness.clock.now,
       hashToken: harness.tokenDeps.hashToken,
       previewReads: preview.effects,
@@ -803,7 +865,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       ...demoSubscription(),
       id: "sub_demo_second",
     };
-    const harness = makeHarness(SCAN_CLOCK_START, [
+    const harness = await makeHarness(SCAN_CLOCK_START, [
       demoSubscription(),
       second,
     ]);
@@ -829,7 +891,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // on repeat, and leaves confirmationId, operationId and
   // newSubscriptionId null.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const created = await scanCreated(harness);
     const declineDeps = {
       repository: harness.repository,
@@ -858,6 +920,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       DEMO_FIXTURE,
       {
         repository: harness.repository,
+        policies: harness.policies,
         now: harness.clock.now,
         hashToken: harness.tokenDeps.hashToken,
         previewReads: preview.effects,
@@ -891,7 +954,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // hardcoded — and no internal identifiers or token material leak from
   // either projection.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const created = await scanCreated(harness);
     const preview = makePreviewReads(demoSubscription());
     const outcome = await evaluateSelectedDate(
@@ -899,6 +962,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       DEMO_FIXTURE,
       {
         repository: harness.repository,
+        policies: harness.policies,
         now: harness.clock.now,
         hashToken: harness.tokenDeps.hashToken,
         previewReads: preview.effects,
@@ -985,7 +1049,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // replacement exactly once and records the verified linkage on the
   // intervention, the confirmation and the operation record.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await toPreviewReady(harness);
     const execution = makeExecutionHarness(harness);
     const outcome = await confirmInterventionExecution(
@@ -1044,7 +1108,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // and an in-flight "executing" latch both refuse without invoking the
   // path or creating another confirmation.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await toPreviewReady(harness);
     const execution = makeExecutionHarness(harness);
     const first = await confirmInterventionExecution(
@@ -1070,7 +1134,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
 
     // An in-flight latch refuses too: a fresh preview-ready record written
     // to "executing" simulates a concurrent submission mid-execution.
-    const latchHarness = makeHarness();
+    const latchHarness = await makeHarness();
     const previewRecord = await toPreviewReady(latchHarness);
     await latchHarness.repository.write({
       ...previewRecord,
@@ -1096,7 +1160,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // confirmation is created — both a pre-selection state and a declined
   // record refuse.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await scanCreated(harness);
     const execution = makeExecutionHarness(harness);
     const outcome = await confirmInterventionExecution(
@@ -1136,7 +1200,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // s12: an expired invitation is blocked before any confirmation is
   // created, and its stored state is untouched.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     const previewRecord = await toPreviewReady(harness);
     harness.clock.advanceMinutes(31);
     const execution = makeExecutionHarness(harness);
@@ -1171,7 +1235,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // manual-recovery-required, which is terminal: no resubmission and no
   // decline can follow, and the consumed confirmation stays consumed.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await toPreviewReady(harness);
     const execution = makeExecutionHarness(harness, { createFails: true });
     const outcome = await confirmInterventionExecution(
@@ -1233,7 +1297,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // before the cancellation step — the write-before-cancel contract seen
   // from the intervention side.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await toPreviewReady(harness);
     const execution = makeExecutionHarness(harness);
     const outcome = await confirmInterventionExecution(
@@ -1263,7 +1327,7 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
   // (no write path exists anywhere), so token possession alone can never
   // reach the internal function.
   {
-    const harness = makeHarness();
+    const harness = await makeHarness();
     await toPreviewReady(harness);
     const execution = makeExecutionHarness(harness);
     const before = JSON.stringify(await harness.repository.list());
@@ -1320,6 +1384,304 @@ export async function validateInterventionFlow(): Promise<InterventionValidation
       "s15: a bound verified record must open the gate — the refusal is not hardcoded",
     );
     record("s15-gate-refuses-without-verification", "verification-required");
+  }
+
+  // s16: the scan resolves the active saved policy, evaluates the
+  // opportunity and the suitability ceiling under it, and binds its
+  // version to the invitation. Differential proof: under the frozen
+  // default (ceiling 50000) both runs would create — a permissive v2
+  // creates and binds v2, a low-ceiling v2 refuses with nothing created,
+  // and an empty policy store fails safely.
+  {
+    const harness = await makeHarness();
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, harness.clock.now()),
+    );
+    const created = await scanCreated(harness);
+    check(
+      created.policyVersion === "duelogic-policy-v2",
+      "s16: the invitation must store the active policyVersion",
+    );
+
+    const lowHarness = await makeHarness();
+    await lowHarness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 12_000, lowHarness.clock.now()),
+    );
+    const refused = await runScheduledInterventionScan(
+      DEMO_FIXTURE,
+      lowHarness.scanDeps,
+    );
+    check(
+      refused.outcome === "fixture-error" &&
+        refused.reason === "no-designated-opportunity",
+      "s16: a low active ceiling must prevent invitation creation",
+    );
+    check(
+      (await lowHarness.repository.list()).length === 0,
+      "s16: the refused scan must create nothing",
+    );
+
+    const noPolicy = await runScheduledInterventionScan(DEMO_FIXTURE, {
+      ...lowHarness.scanDeps,
+      policies: createInMemoryMerchantPolicyRepository(),
+    });
+    check(
+      noPolicy.outcome === "fixture-error" &&
+        noPolicy.reason === "policy-resolution-failed",
+      "s16: a missing active policy must fail safely with no invitation",
+    );
+    check(
+      (await lowHarness.repository.list()).length === 0,
+      "s16: the policy-resolution failure must create nothing",
+    );
+    record("s16-scan-uses-active-policy", "bound");
+  }
+
+  // s17: a pending invitation remains bound to its creation-time policy.
+  // v3's 12000-cent ceiling would escalate the 12500-cent payment; the
+  // invitation bound to v2 (30000) still approves after v3 activates.
+  {
+    const harness = await makeHarness();
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, harness.clock.now()),
+    );
+    const created = await scanCreated(harness);
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v3", 12_000, harness.clock.now()),
+    );
+    const preview = makePreviewReads(demoSubscription());
+    const outcome = await evaluateSelectedDate(
+      { token: FIRST_RAW_TOKEN, selectedDate: created.suggestedDate },
+      DEMO_FIXTURE,
+      {
+        repository: harness.repository,
+        policies: harness.policies,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+        previewReads: preview.effects,
+      },
+    );
+    check(
+      outcome.ok &&
+        outcome.record.status === "preview-ready" &&
+        outcome.record.policyOutcome === "approved",
+      "s17: evaluation must approve under the bound v2 despite active v3",
+    );
+    check(
+      outcome.ok && outcome.record.policyVersion === "duelogic-policy-v2",
+      "s17: the pending invitation must remain bound to v2",
+    );
+    record("s17-pending-intervention-stays-bound", "bound-v2");
+  }
+
+  // s18: the exact stored version drives the evaluation in both
+  // directions: bound v2 approves while active v3 would escalate; rebound
+  // to v3 escalates while the newer active v4 would approve.
+  {
+    const harness = await makeHarness();
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, harness.clock.now()),
+    );
+    const created = await scanCreated(harness);
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v3", 12_000, harness.clock.now()),
+    );
+    const preview = makePreviewReads(demoSubscription());
+    const deps = {
+      repository: harness.repository,
+      policies: harness.policies,
+      now: harness.clock.now,
+      hashToken: harness.tokenDeps.hashToken,
+      previewReads: preview.effects,
+    };
+    const underV2 = await evaluateSelectedDate(
+      { token: FIRST_RAW_TOKEN, selectedDate: created.suggestedDate },
+      DEMO_FIXTURE,
+      deps,
+    );
+    check(
+      underV2.ok && underV2.record.policyOutcome === "approved",
+      "s18: the stored v2 binding must approve",
+    );
+
+    const stored = (await harness.repository.readById(
+      created.interventionId,
+    )) as DueLogicInterventionRecord;
+    await harness.repository.write({
+      ...stored,
+      policyVersion: "duelogic-policy-v3",
+    });
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v4", 30_000, harness.clock.now()),
+    );
+    const underV3 = await evaluateSelectedDate(
+      { token: FIRST_RAW_TOKEN, selectedDate: created.suggestedDate },
+      DEMO_FIXTURE,
+      deps,
+    );
+    check(
+      underV3.ok &&
+        underV3.record.policyOutcome === "escalate" &&
+        underV3.record.policyReasonCode === "AMOUNT_CEILING_EXCEEDED" &&
+        underV3.record.policyVersion === "duelogic-policy-v3",
+      "s18: the stored v3 binding must escalate although the active v4 would approve",
+    );
+    record("s18-bound-version-drives-evaluation", "stored-version-governs");
+  }
+
+  // s19: an unresolvable bound version refuses safely — before any
+  // evaluation or preview read, recording no decision and no execution
+  // state, with no fallback to the active policy or the frozen default.
+  {
+    const harness = await makeHarness();
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, harness.clock.now()),
+    );
+    const created = await scanCreated(harness);
+    const stored = (await harness.repository.readById(
+      created.interventionId,
+    )) as DueLogicInterventionRecord;
+    await harness.repository.write({
+      ...stored,
+      policyVersion: "duelogic-policy-v9",
+    });
+    const preview = makePreviewReads(demoSubscription());
+    const outcome = await evaluateSelectedDate(
+      { token: FIRST_RAW_TOKEN, selectedDate: created.suggestedDate },
+      DEMO_FIXTURE,
+      {
+        repository: harness.repository,
+        policies: harness.policies,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+        previewReads: preview.effects,
+      },
+    );
+    check(
+      !outcome.ok && outcome.reason === "policy-unresolved",
+      "s19: an unresolvable bound version must refuse",
+    );
+    check(preview.calls.length === 0, "s19: no preview read may occur");
+    const after = await harness.repository.readById(created.interventionId);
+    check(
+      after !== null &&
+        after.policyVersion === "duelogic-policy-v9" &&
+        after.selectedDate === null &&
+        after.policyOutcome === null &&
+        after.confirmationId === null &&
+        after.operationId === null &&
+        after.newSubscriptionId === null,
+      "s19: the refusal must record no decision and no execution state",
+    );
+    record("s19-missing-bound-version-refuses", "refused");
+  }
+
+  // s20: a new invitation binds the version active at its own creation.
+  // Two isolated intervention repositories share one policy store: the
+  // earlier invitation binds v2; after v3 activates, a separate eligible
+  // invitation binds v3 and the earlier one keeps v2.
+  {
+    const sharedPolicies = createInMemoryMerchantPolicyRepository();
+    const firstHarness = await makeHarness(
+      SCAN_CLOCK_START,
+      [demoSubscription()],
+      sharedPolicies,
+    );
+    await sharedPolicies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, firstHarness.clock.now()),
+    );
+    const earlier = await scanCreated(firstHarness);
+    check(
+      earlier.policyVersion === "duelogic-policy-v2",
+      "s20: the earlier invitation must bind v2",
+    );
+
+    await sharedPolicies.activate(
+      policySnapshotFor("duelogic-policy-v3", 30_000, firstHarness.clock.now()),
+    );
+    const secondHarness = await makeHarness(
+      SCAN_CLOCK_START,
+      [demoSubscription()],
+      sharedPolicies,
+    );
+    const newer = await scanCreated(secondHarness);
+    check(
+      newer.policyVersion === "duelogic-policy-v3",
+      "s20: the new invitation must bind the newer active version",
+    );
+    const earlierStored = await firstHarness.repository.readById(
+      earlier.interventionId,
+    );
+    check(
+      earlierStored !== null &&
+        earlierStored.policyVersion === "duelogic-policy-v2",
+      "s20: the earlier invitation must remain bound to v2",
+    );
+    record("s20-new-invitation-uses-newer-policy", "per-creation-binding");
+  }
+
+  // s21: policy binding leaves the transaction-verification gate closed —
+  // no verification record exists or can be created, the confirmation
+  // control stays disabled, the gate refuses, and no internal execution
+  // call occurs anywhere in this stage.
+  {
+    const harness = await makeHarness();
+    await harness.policies.activate(
+      policySnapshotFor("duelogic-policy-v2", 30_000, harness.clock.now()),
+    );
+    const created = await scanCreated(harness);
+    const preview = makePreviewReads(demoSubscription());
+    const outcome = await evaluateSelectedDate(
+      { token: FIRST_RAW_TOKEN, selectedDate: created.suggestedDate },
+      DEMO_FIXTURE,
+      {
+        repository: harness.repository,
+        policies: harness.policies,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+        previewReads: preview.effects,
+      },
+    );
+    check(
+      outcome.ok && outcome.record.status === "preview-ready",
+      "s21: the bound evaluation must reach preview-ready",
+    );
+    const verifications = createEmptyDevTransactionVerificationRepository();
+    check(
+      (await verifications.readVerifiedForIntervention(
+        created.interventionId,
+      )) === null,
+      "s21: policy binding must create no transaction-verification record",
+    );
+    const stored = (await harness.repository.readById(
+      created.interventionId,
+    )) as DueLogicInterventionRecord;
+    check(
+      toCustomerInterventionProjection(stored, harness.clock.now())
+        .finalConfirmationEnabled === false,
+      "s21: the confirmation button must remain disabled",
+    );
+    const gate = await requireTransactionVerification(
+      { token: FIRST_RAW_TOKEN },
+      {
+        repository: harness.repository,
+        verifications,
+        now: harness.clock.now,
+        hashToken: harness.tokenDeps.hashToken,
+      },
+    );
+    check(
+      !gate.ok && gate.reason === "verification-required",
+      "s21: the execution gate must still refuse",
+    );
+    const execution = makeExecutionHarness(harness);
+    check(
+      execution.pathCalls.length === 0 &&
+        execution.confirmationsCreated() === 0 &&
+        execution.operationsStarted() === 0,
+      "s21: no internal execution call may occur in this stage",
+    );
+    record("s21-verification-gate-still-closed", "still-gated");
   }
 
   return { scenarioCount: table.length, decisionTable: table };

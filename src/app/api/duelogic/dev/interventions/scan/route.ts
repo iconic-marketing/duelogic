@@ -16,6 +16,7 @@ import {
   runScheduledInterventionScan,
 } from "@/lib/duelogic/intervention-service";
 import { validateInterventionFlow } from "@/lib/duelogic/intervention-validation";
+import { getDevMerchantPolicyRepository } from "@/lib/duelogic/policy/dev-policy-store";
 import {
   PinchApiError,
   PinchAuthError,
@@ -61,6 +62,10 @@ export async function POST(request: NextRequest) {
         subscriptionReads: createInterventionPinchReadEffects(
           INTERVENTION_DEMO_FIXTURE.merchantTimezone,
         ),
+        // The saved merchant policy store: the scan binds the active
+        // snapshot's version to the created intervention. Server-held only
+        // — the browser can never supply policy identity.
+        policies: await getDevMerchantPolicyRepository(),
         now: () => new Date().toISOString(),
         generateInterventionId,
         generateNotificationId: generateInterventionNotificationId,

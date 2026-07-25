@@ -4,6 +4,13 @@
  * (Stage 2) customer-confirmed execution through the existing protected
  * replacement path.
  *
+ * Policy binding: the scan resolves the active saved merchant policy
+ * snapshot once and stores its policyVersion on the intervention; customer
+ * date evaluation resolves that exact stored version through the injected
+ * snapshot repository. A later activation never alters a pending
+ * invitation, and an unresolvable bound version refuses safely with no
+ * preview and no fallback.
+ *
  * Every function takes injected dependencies (repositories, clock, token
  * generator, token hasher, read-only subscription/preview effects, and the
  * replacement-path invoker), so the deterministic validation suite drives
@@ -50,7 +57,10 @@ import {
   type PermanentPolicyEvaluationRequest,
 } from "./policy/engine";
 import { resolvePlanScheduleContext } from "./policy/plan-schedule-resolver";
-import { DEFAULT_DUELOGIC_POLICY } from "./policy/rules";
+import type {
+  MerchantPolicyRepository,
+  MerchantPolicySnapshot,
+} from "./policy/policy-snapshot";
 import { buildSeedPolicyEvaluations } from "./seed-policy-evaluations";
 import {
   resolveActiveSubscription,
@@ -95,6 +105,12 @@ export interface InterventionScanDeps extends InterventionTokenDeps {
   notifications: InterventionNotificationRepository;
   /** Read-only subscription discovery effects — never a mutation. */
   subscriptionReads: SubscriptionReadEffects;
+  /**
+   * The saved merchant policy snapshots. The scan resolves the active
+   * snapshot once and binds its policyVersion to the created intervention;
+   * there is no silent fallback to the frozen default.
+   */
+  policies: MerchantPolicyRepository;
   /** Returns the current ISO timestamp. Injected — never a hidden clock. */
   now(): string;
   invitationLifetimeMinutes: number;
@@ -125,6 +141,12 @@ export interface InterventionPreviewReadEffects {
 
 export interface InterventionRespondDeps {
   repository: DueLogicInterventionRepository;
+  /**
+   * The saved merchant policy snapshots. Customer date evaluation resolves
+   * the intervention's stored policyVersion — never the currently active
+   * policy and never a frozen-default fallback.
+   */
+  policies: MerchantPolicyRepository;
   now(): string;
   hashToken(rawToken: string): string;
   previewReads: InterventionPreviewReadEffects;
@@ -182,6 +204,7 @@ export type ScheduledScanOutcome =
       /** Safe stage vocabulary only — never response content. */
       reason:
         | "clock-unreadable"
+        | "policy-resolution-failed"
         | "no-designated-opportunity"
         | "designated-payer-mismatch"
         | "subscription-resolution-failed"
@@ -217,12 +240,34 @@ export async function runScheduledInterventionScan(
     };
   }
 
-  // 1-3. Frozen synthetic evidence: detector output and the frozen policy
-  // evaluations over the seeded history. The designated opportunity is the
-  // first approved frozen evaluation in payer-ID order — the same frozen
-  // decision the dashboard already renders — and it must match the
-  // fixture's explicit designation.
-  const { flags, policyItems } = buildSeedPolicyEvaluations();
+  // 1a. Resolve the active saved merchant policy — selected once, here at
+  // creation time, and authoritative for this intervention's whole life.
+  // A missing, unreadable or inconsistent snapshot fails safely with no
+  // invitation; there is no silent fallback to the frozen default.
+  let activeSnapshot: MerchantPolicySnapshot | null;
+  try {
+    activeSnapshot = await deps.policies.readActive(fixture.merchantId);
+  } catch {
+    activeSnapshot = null;
+  }
+  if (
+    activeSnapshot === null ||
+    activeSnapshot.policyVersion !== activeSnapshot.policy.version
+  ) {
+    return {
+      outcome: "fixture-error",
+      reason: "policy-resolution-failed",
+      detail:
+        "No consistent active merchant policy snapshot could be resolved for the scan.",
+    };
+  }
+  const scanPolicy = activeSnapshot.policy;
+
+  // 1-3. Synthetic evidence: detector output and the policy evaluations
+  // over the seeded history, evaluated under the active saved policy. The
+  // designated opportunity is the first approved evaluation in payer-ID
+  // order and it must match the fixture's explicit designation.
+  const { flags, policyItems } = buildSeedPolicyEvaluations(scanPolicy);
   const designated = [...policyItems]
     .sort((a, b) => a.payer.id.localeCompare(b.payer.id))
     .find((item) => item.decision.outcome === "approved");
@@ -343,14 +388,12 @@ export async function runScheduledInterventionScan(
         "The detector-derived suggested date does not fall usably inside the assigned billing cycle.",
     };
   }
-  if (
-    fixture.expectedRecurringAmountCents >
-    DEFAULT_DUELOGIC_POLICY.amountCeilingCents
-  ) {
+  if (fixture.expectedRecurringAmountCents > scanPolicy.amountCeilingCents) {
     return {
       outcome: "fixture-error",
       reason: "unsuitable-for-invitation",
-      detail: "The payment amount exceeds the policy's automatic ceiling.",
+      detail:
+        "The payment amount exceeds the active policy's automatic ceiling.",
     };
   }
 
@@ -395,7 +438,9 @@ export async function runScheduledInterventionScan(
     subscriptionId: subscription.id,
     planId: fixture.planId,
     patternFlagId: patternFlag.id,
-    policyVersion: DEFAULT_DUELOGIC_POLICY.version,
+    // The governing policy is bound at creation; later activations never
+    // alter this invitation.
+    policyVersion: activeSnapshot.policyVersion,
     scheduleCadence: cycle.scheduleCadence,
     changeMode: "permanent",
     currentStartDate: subscription.startDate,
@@ -512,6 +557,7 @@ export type EvaluateSelectedDateOutcome =
         | "invalid-date"
         | "outside-window"
         | "not-evaluable"
+        | "policy-unresolved"
         | "preview-unavailable"
         | "store";
       record?: DueLogicInterventionRecord;
@@ -554,6 +600,30 @@ export async function evaluateSelectedDate(
   }
   if (!CHECKABLE_STATUSES.has(status)) {
     return { ok: false, reason: "not-evaluable", record };
+  }
+
+  // The intervention-bound immutable policy: the version stored at
+  // creation is authoritative for every later evaluation on this
+  // invitation — a newer activation never alters it. An unresolvable or
+  // inconsistent bound version refuses here, before any evaluation or
+  // preview read; there is no fallback to the currently active policy or
+  // the frozen default.
+  let boundSnapshot: MerchantPolicySnapshot | null;
+  try {
+    boundSnapshot = await deps.policies.readByVersion(
+      record.merchantId,
+      record.policyVersion,
+    );
+  } catch {
+    boundSnapshot = null;
+  }
+  if (
+    boundSnapshot === null ||
+    boundSnapshot.merchantId !== record.merchantId ||
+    boundSnapshot.policyVersion !== record.policyVersion ||
+    boundSnapshot.policyVersion !== boundSnapshot.policy.version
+  ) {
+    return { ok: false, reason: "policy-unresolved", record };
   }
 
   // A refused selection returns the record to awaiting-date-selection so
@@ -654,7 +724,8 @@ export async function evaluateSelectedDate(
   try {
     // No executed-verified prior schedule changes exist for the
     // demonstration payer; the empty history is explicit, not inferred.
-    decision = evaluateScheduleChange(request, [], DEFAULT_DUELOGIC_POLICY);
+    // The policy is the intervention-bound snapshot resolved above.
+    decision = evaluateScheduleChange(request, [], boundSnapshot.policy);
   } catch (error) {
     if (error instanceof PolicyValidationError) {
       // e.g. the selected date equals the current payment date. Customer
