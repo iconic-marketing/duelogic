@@ -134,6 +134,23 @@ The webhook receiver:
 - Display the governing assumption beside the result, not in a footnote.
 - The model may interpret customer language, but deterministic code makes eligibility and execution decisions.
 
+## Policy and eligibility engine
+
+- The policy is declarative and versioned; all thresholds live in `DEFAULT_DUELOGIC_POLICY` (`src/lib/duelogic/policy/rules.ts`), and the engine always evaluates the supplied policy's values (e.g. `policy.amountCeilingCents`), so merchant-specific policies override defaults without engine changes.
+- Defaults: payment amount ceiling 50000 cents; 2 executed-verified temporary changes per rolling 12 months; 1 executed-verified permanent change per rolling 12 months.
+- Temporary shifts are limited to 5 calendar days; a longer request returns the furthest permitted date, not a rejection.
+- Permanent changes are not subject to the temporary five-day cap.
+- Permanent policy supports weekly, fortnightly and monthly cadences.
+- Cadence and billing-cycle boundaries are supplied explicitly from trusted metadata and are never inferred from payment spacing, descriptions or dishonour history.
+- Permanent changes support `current-and-future` and `next-cycle-and-future`; a permanent payment may move earlier or later within its assigned billing cycle, and every revised payment remains within the billing cycle of the payment it replaces.
+- Weekly anchors preserve their position inside a 7-day cycle; fortnightly inside a 14-day cycle; monthly anchors preserve their day of month, restricted to days 1-28 in the MVP.
+- Current-cycle permanent anchors must be strictly after `evaluationDate`; an unavailable current-cycle anchor returns a next-cycle alternative when one can be validly derived.
+- Close-payment warnings are cadence-specific: weekly below 3 days, fortnightly below 5, monthly below 7. A close gap is a warning and acknowledgement requirement, never an automatic rejection.
+- Invalid cycle metadata is a validation error (`INVALID_CYCLE_METADATA`); a valid but unsupported cadence is a policy escalation. Never confuse the two.
+- Arrears are supplied explicitly and never inferred from dishonour history.
+- Only executed-verified changes consume usage limits; temporary and permanent counters are separate; rolling usage is anchored to the explicit `evaluationDate` (window start inclusive, evaluation date exclusive).
+- The engine never uses the system clock and decides only — it never calls Pinch. Live Pinch status must be re-checked by the execution layer immediately before mutation; only a live payment with status `scheduled` may be changed.
+- Policy support for a cadence does not itself prove live Pinch execution support for that cadence.
 
 ## Working rules
 

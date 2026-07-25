@@ -143,6 +143,94 @@ export interface PatternFlag {
 }
 
 /**
+ * Schedule cadence supplied by trusted merchant, plan or schedule metadata.
+ * Never inferred from payment-date spacing, descriptions, dishonours, retry
+ * dates or detector output. "four-weekly" and "custom" are known but not
+ * supported by the default policy; an unknown string is invalid input.
+ */
+export type ScheduleCadence =
+  | "weekly"
+  | "fortnightly"
+  | "monthly"
+  | "four-weekly"
+  | "custom";
+
+/** The cadences the policy engine can evaluate permanent changes for. */
+export type SupportedScheduleCadence = "weekly" | "fortnightly" | "monthly";
+
+/**
+ * Which assigned billing cycle a permanent change anchors in: move the
+ * current payment within its own cycle, or keep it and anchor inside the
+ * next payment's cycle.
+ */
+export type PermanentEffectiveCycle =
+  | "current-and-future"
+  | "next-cycle-and-future";
+
+export type PriorScheduleChangeStatus =
+  | "executed-verified"
+  | "refused"
+  | "abandoned"
+  | "execution-failed"
+  | "manual-recovery";
+
+/**
+ * One prior schedule-change record. Only "executed-verified" entries consume
+ * rolling usage allowances; that status requires executedDate.
+ */
+export interface PriorScheduleChange {
+  id: string;
+  payerId: string;
+  changeType: "temporary" | "permanent";
+  status: PriorScheduleChangeStatus;
+  /** YYYY-MM-DD; required when status is "executed-verified". */
+  executedDate?: string;
+}
+
+/**
+ * Declarative, versioned DueLogic policy. Values only — every threshold the
+ * engine evaluates lives here, so a merchant-specific policy can override any
+ * value (including amountCeilingCents) without changing engine code.
+ */
+export interface DueLogicPolicy {
+  readonly version: string;
+  /** Ceiling for one scheduled payment, integer cents. */
+  readonly amountCeilingCents: number;
+  readonly temporaryChange: {
+    readonly maxVerifiedUses: number;
+    readonly rollingPeriodMonths: number;
+    readonly maxShiftDays: number;
+  };
+  readonly permanentChange: {
+    readonly maxVerifiedUses: number;
+    readonly rollingPeriodMonths: number;
+    readonly supportedCadences: readonly ScheduleCadence[];
+    readonly keepPaymentWithinAssignedCycle: boolean;
+    readonly cycleLengthDays: {
+      readonly weekly: number;
+      readonly fortnightly: number;
+    };
+    readonly monthlyAnchorDay: {
+      readonly minimum: number;
+      readonly maximum: number;
+    };
+    readonly allowSameDayCurrentCycleChange: boolean;
+    readonly closePaymentWarningDays: {
+      readonly weekly?: number;
+      readonly fortnightly?: number;
+      readonly monthly?: number;
+    };
+    readonly closePaymentAction: "warn-and-confirm";
+    readonly unsupportedCadenceAction: "escalate";
+    readonly overLimitAction: "escalate";
+  };
+  readonly arrears: {
+    readonly disqualifyWhenCurrentArrearsCentsAbove: number;
+    readonly action: "escalate";
+  };
+}
+
+/**
  * Deterministic record of a payment-date change decision. Eligibility and
  * execution are decided by code against a versioned policy — never by model
  * output — so every decision carries its code and policy version.
