@@ -27,6 +27,16 @@ import type {
   ScheduleCadence,
   SupportedScheduleCadence,
 } from "../schema";
+import {
+  addCalendarDays,
+  addCalendarMonthsSameDay,
+  calendarDaysBetween,
+  daysInMonth,
+  formatCalendarDate,
+  monthsEarlier,
+  parseCalendarDate,
+  type CalendarDate,
+} from "../calendar-date";
 import { DEFAULT_DUELOGIC_POLICY } from "./rules";
 
 // ---------------------------------------------------------------------------
@@ -209,7 +219,9 @@ export type PolicyValidationCode =
   | "EXECUTED_CHANGE_DATE_REQUIRED"
   | "INVALID_POLICY_VALUE"
   | "INVALID_CHANGE_TYPE"
-  | "INVALID_HISTORY_STATUS";
+  | "INVALID_HISTORY_STATUS"
+  | "INVALID_PLAN_SCHEDULE_CONFIGURATION"
+  | "PLAN_SCHEDULE_CONTEXT_MISMATCH";
 
 /**
  * Invalid input is not a policy decision. Messages are safe by construction:
@@ -231,73 +243,29 @@ function invalid(code: PolicyValidationCode, message: string): never {
 }
 
 // ---------------------------------------------------------------------------
-// Pure calendar helpers (UTC millisecond maths only; no clock reads)
-
-const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-const MS_PER_DAY = 86_400_000;
+// Calendar helpers: shared pure implementations live in ../calendar-date;
+// these thin wrappers convert a null result into the engine's INVALID_DATE
+// validation error, preserving the original engine behaviour exactly.
 
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ] as const;
 
-interface CalendarDate {
-  year: number;
-  month: number;
-  day: number;
-}
-
-/** Strictly parses a real YYYY-MM-DD calendar date, else null. */
-function parseCalendarDate(value: string): CalendarDate | null {
-  if (typeof value !== "string" || !DATE_ONLY_PATTERN.test(value)) {
-    return null;
-  }
-  const [year, month, day] = value.split("-").map(Number);
-  if (month < 1 || month > 12) {
-    return null;
-  }
-  if (day < 1 || day > daysInMonth(year, month)) {
-    return null;
-  }
-  return { year, month, day };
-}
-
-function daysInMonth(year: number, month: number): number {
-  return new Date(Date.UTC(year, month, 0)).getUTCDate();
-}
-
-function utcMs(date: CalendarDate): number {
-  return Date.UTC(date.year, date.month - 1, date.day);
-}
-
-function formatCalendarDate(date: CalendarDate): string {
-  const month = String(date.month).padStart(2, "0");
-  const day = String(date.day).padStart(2, "0");
-  return `${date.year}-${month}-${day}`;
-}
-
 /** Whole calendar days from `from` to `to`; both must be pre-validated. */
 function daysBetween(from: string, to: string): number {
-  const a = parseCalendarDate(from);
-  const b = parseCalendarDate(to);
-  if (a === null || b === null) {
-    return invalid("INVALID_DATE", "A date was not a valid YYYY-MM-DD calendar date.");
-  }
-  return Math.round((utcMs(b) - utcMs(a)) / MS_PER_DAY);
+  const days = calendarDaysBetween(from, to);
+  return days === null
+    ? invalid("INVALID_DATE", "A date was not a valid YYYY-MM-DD calendar date.")
+    : days;
 }
 
 /** The pre-validated date plus whole calendar days. */
 function addDays(value: string, days: number): string {
-  const date = parseCalendarDate(value);
-  if (date === null) {
-    return invalid("INVALID_DATE", "A date was not a valid YYYY-MM-DD calendar date.");
-  }
-  const shifted = new Date(utcMs(date) + days * MS_PER_DAY);
-  return formatCalendarDate({
-    year: shifted.getUTCFullYear(),
-    month: shifted.getUTCMonth() + 1,
-    day: shifted.getUTCDate(),
-  });
+  const result = addCalendarDays(value, days);
+  return result === null
+    ? invalid("INVALID_DATE", "A date was not a valid YYYY-MM-DD calendar date.")
+    : result;
 }
 
 /**
@@ -305,23 +273,11 @@ function addDays(value: string, days: number): string {
  * days that exist in every month (1-28), so no clamping ever applies —
  * never 30-day or average-month arithmetic.
  */
-function addCalendarMonthsSameDay(value: string, months: number): string {
-  const date = parseCalendarDate(value);
-  if (date === null) {
-    return invalid("INVALID_DATE", "A date was not a valid YYYY-MM-DD calendar date.");
-  }
-  const zeroBasedMonth = date.year * 12 + (date.month - 1) + months;
-  const year = Math.floor(zeroBasedMonth / 12);
-  const month = ((zeroBasedMonth % 12) + 12) % 12 + 1;
-  return formatCalendarDate({ year, month, day: date.day });
-}
-
-/** Same calendar day `months` earlier, clamped to the target month length. */
-function monthsEarlier(date: CalendarDate, months: number): CalendarDate {
-  const zeroBasedMonth = date.year * 12 + (date.month - 1) - months;
-  const year = Math.floor(zeroBasedMonth / 12);
-  const month = ((zeroBasedMonth % 12) + 12) % 12 + 1;
-  return { year, month, day: Math.min(date.day, daysInMonth(year, month)) };
+function addMonthsSameDay(value: string, months: number): string {
+  const result = addCalendarMonthsSameDay(value, months);
+  return result === null
+    ? invalid("INVALID_DATE", "A date was not a valid YYYY-MM-DD calendar date.")
+    : result;
 }
 
 // ---------------------------------------------------------------------------
@@ -801,8 +757,8 @@ function buildSchedulePreview(
   }
   return [
     firstRevisedPaymentDate,
-    addCalendarMonthsSameDay(firstRevisedPaymentDate, 1),
-    addCalendarMonthsSameDay(firstRevisedPaymentDate, 2),
+    addMonthsSameDay(firstRevisedPaymentDate, 1),
+    addMonthsSameDay(firstRevisedPaymentDate, 2),
   ];
 }
 

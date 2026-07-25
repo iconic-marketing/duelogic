@@ -152,6 +152,19 @@ The webhook receiver:
 - The engine never uses the system clock and decides only — it never calls Pinch. Live Pinch status must be re-checked by the execution layer immediately before mutation; only a live payment with status `scheduled` may be changed.
 - Policy support for a cadence does not itself prove live Pinch execution support for that cadence.
 
+## Plan-to-schedule configuration
+
+- The Pinch Plan and Subscription responses used by DueLogic do not currently provide a trusted cadence field.
+- Cadence is supplied through merchant-held plan-to-schedule configuration (`MerchantPlanScheduleConfiguration`, resolved by `src/lib/duelogic/policy/plan-schedule-resolver.ts`); plan IDs are merchant-scoped.
+- Plan mappings remain separate from `DEFAULT_DUELOGIC_POLICY`: the policy defines permitted behaviour, the plan map defines schedule structure, and the default policy stays reusable across merchants.
+- Cadence is never inferred from payment spacing or calculated-payment dates — not by the resolver and not by the policy engine.
+- Weekly and fortnightly mappings contain an authoritative `cycleAnchorDate` (the first day of one cycle, not necessarily a payment date); monthly mappings use full calendar months and need no anchor.
+- An unmapped plan escalates for merchant review (`PERMANENT_PLAN_SCHEDULE_UNMAPPED`) — never a guessed cadence, never silent monthly rules.
+- Malformed plan configuration is a validation error (`INVALID_PLAN_SCHEDULE_CONFIGURATION`).
+- A mapped plan whose payment dates contradict its configured cycle sequence produces `PLAN_SCHEDULE_CONTEXT_MISMATCH`.
+- Policy evaluation only receives resolved cadence and cycle boundaries; live Pinch status remains an execution-layer check.
+- Shared pure date helpers live in `src/lib/duelogic/calendar-date.ts` — the engine and resolver must not duplicate inconsistent date logic.
+
 ## Working rules
 
 - Read this file before planning or editing.

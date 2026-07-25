@@ -231,6 +231,51 @@ export interface DueLogicPolicy {
 }
 
 /**
+ * Merchant-held plan-to-schedule configuration. Pinch Plan and Subscription
+ * responses used by DueLogic do not currently provide a trusted cadence
+ * field, so cadence and billing-cycle convention come from this explicit
+ * per-plan mapping — never from payment spacing or calculated-payment dates.
+ * Plan mappings are merchant configuration and stay separate from
+ * DEFAULT_DUELOGIC_POLICY, which is reusable across merchants.
+ */
+export interface WeeklyPlanScheduleDefinition {
+  cadence: "weekly";
+  cycleDefinition: "fixed-days";
+  cycleLengthDays: 7;
+  /**
+   * YYYY-MM-DD first day of one authoritative 7-day cycle. Need not be the
+   * first payment date and need not be a Monday.
+   */
+  cycleAnchorDate: string;
+}
+
+export interface FortnightlyPlanScheduleDefinition {
+  cadence: "fortnightly";
+  cycleDefinition: "fixed-days";
+  cycleLengthDays: 14;
+  /** YYYY-MM-DD first day of one authoritative 14-day cycle. */
+  cycleAnchorDate: string;
+}
+
+/** Monthly plans use full calendar months and require no anchor date. */
+export interface MonthlyPlanScheduleDefinition {
+  cadence: "monthly";
+  cycleDefinition: "calendar-month";
+}
+
+export type PlanScheduleDefinition =
+  | WeeklyPlanScheduleDefinition
+  | FortnightlyPlanScheduleDefinition
+  | MonthlyPlanScheduleDefinition;
+
+export interface MerchantPlanScheduleConfiguration {
+  /** The internal or Pinch merchant reference used by the caller. */
+  merchantId: string;
+  /** Keyed by the exact merchant-scoped plan ID. */
+  plans: Readonly<Record<string, PlanScheduleDefinition>>;
+}
+
+/**
  * Deterministic record of a payment-date change decision. Eligibility and
  * execution are decided by code against a versioned policy — never by model
  * output — so every decision carries its code and policy version.
