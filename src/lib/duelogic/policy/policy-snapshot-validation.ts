@@ -55,12 +55,19 @@
  * s19 a further activation updates replay and opportunity inputs without
  *     changing the seed, the detector or the aggregation logic;
  * s20 the no-argument path used by the scheduled intervention scan and
- *     customer date evaluation remains frozen-default after activation.
+ *     customer date evaluation remains frozen-default after activation;
+ * s21 transaction verification and gated execution are unaffected by
+ *     policy adoption — activating a policy creates no verification
+ *     record and cannot open the execution gate.
  */
 
 import { calculateMerchantOpportunity } from "../merchant-opportunity";
 import type { DueLogicPolicy } from "../schema";
 import { seedPayers } from "../seed-payment-history";
+import {
+  createEmptyDevTransactionVerificationRepository,
+  evaluateTransactionVerification,
+} from "../transaction-verification";
 import {
   buildSeedPolicyEvaluations,
   type SeedPolicyEvaluations,
@@ -981,7 +988,48 @@ export async function validatePolicySnapshotFoundation(): Promise<PolicySnapshot
     record("s20-intervention-and-customer-paths-frozen", "frozen");
   }
 
-  check(table.length === 20, `expected 20 scenarios, produced ${table.length}`);
+  // s21: transaction verification and gated execution are unaffected by
+  // policy adoption. Activating a new policy writes nothing to the
+  // (deliberately empty, read-only) transaction-verification repository,
+  // and the gate evaluation still refuses for want of a verified record —
+  // so replay/opportunity adoption can never open the customer execution
+  // path.
+  {
+    const clock = makeClock();
+    const repository = await installedRepository(clock);
+    const outcome = await processPolicyActivationRequest(
+      { amountCeilingCents: 20_000 },
+      { repository, merchantId: DEV_POLICY_MERCHANT_ID, now: clock },
+    );
+    check(outcome.ok, "s21: the fixture activation must succeed");
+    const verifications = createEmptyDevTransactionVerificationRepository();
+    check(
+      (await verifications.readVerifiedForIntervention("int_demo_01")) ===
+        null,
+      "s21: policy activation must create no transaction-verification record",
+    );
+    const evaluation = evaluateTransactionVerification(
+      null,
+      {
+        interventionId: "int_demo_01",
+        merchantId: "mch_demo",
+        payerId: "pyr_demo",
+        subscriptionId: "sub_demo_active",
+        selectedDate: "2026-08-18",
+        currentPayments: [{ paymentDate: "2026-08-14", amountInCents: 12500 }],
+        proposedPayments: [{ paymentDate: "2026-08-18", amountInCents: 12500 }],
+        policyVersion: DEFAULT_DUELOGIC_POLICY.version,
+      },
+      clock(),
+    );
+    check(
+      !evaluation.ok && evaluation.reason === "missing",
+      "s21: the execution gate must still refuse without a verified record",
+    );
+    record("s21-verification-gate-unaffected", "still-gated");
+  }
+
+  check(table.length === 21, `expected 21 scenarios, produced ${table.length}`);
   return { scenarioCount: table.length, decisionTable: table };
 }
 
