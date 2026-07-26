@@ -1,6 +1,7 @@
 import { headers } from "next/headers";
 import { notFound } from "next/navigation";
 import { areLocalhostRequestHeaders } from "@/lib/dev/localhost-guard";
+import { getDevDemoManifestRepository } from "@/lib/duelogic/dev-demo-store";
 import { getDevInterventionRepository } from "@/lib/duelogic/dev-intervention-store";
 import { toCustomerInterventionProjection } from "@/lib/duelogic/intervention";
 import {
@@ -59,7 +60,10 @@ export default async function CustomerReviewPage({
   if (record === null) {
     return (
       <main className="mx-auto w-full max-w-xl px-6 py-10 font-sans text-sm">
-        <h1 className="text-2xl font-semibold tracking-tight">
+        <p className="text-xs font-medium text-zinc-500 dark:text-zinc-500">
+          DueLogic payment schedule review
+        </p>
+        <h1 className="mt-1 text-2xl font-semibold tracking-tight">
           Review your payment schedule
         </h1>
         <p className="mt-4">
@@ -68,6 +72,20 @@ export default async function CustomerReviewPage({
         </p>
       </main>
     );
+  }
+
+  // Development evidence-provenance label, where applicable: a demo-run
+  // scenario carries its stored provenance (matched server-side by
+  // intervention ID — never by token). Non-demo invitations show nothing.
+  let provenanceLabel: string | null = null;
+  try {
+    const manifest = await getDevDemoManifestRepository().read();
+    provenanceLabel =
+      manifest?.scenarios.find(
+        (scenario) => scenario.interventionId === record.interventionId,
+      )?.provenanceLabel ?? null;
+  } catch {
+    provenanceLabel = null;
   }
 
   // Server-derived verification state from the shared development store.
@@ -101,9 +119,19 @@ export default async function CustomerReviewPage({
 
   return (
     <main className="mx-auto w-full max-w-xl px-6 py-10 font-sans text-sm">
-      <h1 className="text-2xl font-semibold tracking-tight">
+      <p className="text-xs font-medium text-zinc-500 dark:text-zinc-500">
+        DueLogic payment schedule review
+      </p>
+      <h1 className="mt-1 text-2xl font-semibold tracking-tight">
         Review your payment schedule
       </h1>
+      {provenanceLabel !== null ? (
+        <p className="mt-2">
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300">
+            {provenanceLabel}
+          </span>
+        </p>
+      ) : null}
       <ReviewForm token={rawToken} initialView={view} initialMovement={movement} />
     </main>
   );

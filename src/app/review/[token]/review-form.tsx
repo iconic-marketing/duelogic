@@ -470,6 +470,16 @@ export function ReviewForm({
         <p className="font-medium text-green-800 dark:text-green-400">
           Your new payment schedule is confirmed.
         </p>
+        <p className="text-zinc-600 dark:text-zinc-400">
+          Your recurring schedule has been permanently replaced with the
+          exact dates and amounts shown below.
+        </p>
+        {view.currentPayments !== null ? (
+          <ScheduleList
+            title="Your previous schedule (before the change)"
+            payments={view.currentPayments}
+          />
+        ) : null}
         {view.proposedPayments !== null ? (
           <ScheduleList
             title="Your new schedule (verified next three payments)"
@@ -549,6 +559,19 @@ export function ReviewForm({
 
   return (
     <div className="mt-4 flex flex-col gap-5">
+      {/* Why the review is available, then the invitation's validity. */}
+      <div>
+        <p className="text-zinc-600 dark:text-zinc-400">
+          An upcoming payment may be eligible for an alternative date. No
+          change will be made unless you complete verification and give
+          final confirmation.
+        </p>
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">
+          This invitation expires at {formatExpiry(view.expiresAt)}.
+        </p>
+      </div>
+
+      {/* Current upcoming payment details. */}
       <div className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
         <dl className="flex flex-col gap-0.5">
           <div className="flex gap-2">
@@ -567,9 +590,6 @@ export function ReviewForm({
             </dd>
           </div>
         </dl>
-        <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-500">
-          This invitation expires at {formatExpiry(view.expiresAt)}.
-        </p>
       </div>
 
       {/* Movement choice: server-derived availability only. */}
@@ -806,11 +826,6 @@ export function ReviewForm({
               {view.policyExplanation}
             </p>
           ) : null}
-          {view.warningExplanations.map((warning) => (
-            <p key={warning} className="text-amber-700 dark:text-amber-400">
-              {warning}
-            </p>
-          ))}
           <p className="text-amber-700 dark:text-amber-400">
             Confirming will replace your existing recurring payment schedule
             with the proposed schedule shown below.
@@ -835,6 +850,12 @@ export function ReviewForm({
               {formatDisplayDate(view.selectedDate)}
             </p>
           ) : null}
+          {/* Close-payment warnings, after the exact dates they concern. */}
+          {view.warningExplanations.map((warning) => (
+            <p key={warning} className="text-amber-700 dark:text-amber-400">
+              {warning}
+            </p>
+          ))}
         </div>
       ) : null}
 

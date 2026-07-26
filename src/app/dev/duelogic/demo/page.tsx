@@ -14,6 +14,12 @@ import { PrepareDemoButton } from "./prepare-button";
  * running under `next dev` on a direct localhost request — the same
  * header rules as the other development pages.
  *
+ * Content follows the presentation flow a first-time presenter needs:
+ * the development/provenance notice, the Prepare demo control and status,
+ * the recommended demo sequence, direct navigation, the active customer
+ * journeys, the two completed results, the process-local reminder, and
+ * supporting technical detail (demoRunId, suite count) at the bottom.
+ *
  * The scenario links use the stored secure reviewPath values as hrefs
  * only; the raw token, full review URLs and every internal identifier
  * (merchant, payer, payment, subscription, plan, source, policy JSON)
@@ -44,6 +50,15 @@ const NAV_LINKS = [
   { label: "SMS inbox", href: "/dev/duelogic/sms" },
 ] as const;
 
+const DEMO_SEQUENCE = [
+  "Prepare the demo below.",
+  "Open the merchant dashboard and walk the policy, historical impact and opportunity sections.",
+  "Open the simulated customer email inbox and choose an invitation.",
+  "Follow the customer journey from the invitation's review link.",
+  "Open the simulated SMS inbox when the journey requests verification.",
+  "View the completed result evidence from the cards below.",
+] as const;
+
 export default async function DemoSetupPage() {
   if (process.env.NODE_ENV !== "development") {
     notFound();
@@ -58,6 +73,12 @@ export default async function DemoSetupPage() {
 
   const demo = toDemoSetupProjection(
     await getDevDemoManifestRepository().read(),
+  );
+  const journeys = demo.scenarios.filter(
+    (scenario) => scenario.kind === "customer-journey",
+  );
+  const completed = demo.scenarios.filter(
+    (scenario) => scenario.kind === "completed-result",
   );
 
   return (
@@ -80,19 +101,21 @@ export default async function DemoSetupPage() {
       <h1 className="mt-6 text-2xl font-semibold tracking-tight">
         Demo Setup
       </h1>
-      <p className="mt-2 text-zinc-600 dark:text-zinc-400">
-        Prepare demo recreates the complete DueLogic presentation state in
-        one click: three tokenised customer journeys with fresh simulated
-        invitation emails, plus the two completed-result fixtures. It
-        removes only the records created by the previous demo run —
-        unrelated records and all live sandbox evidence stay untouched.
-      </p>
-      <ul className="mt-3 list-disc pl-5 text-zinc-600 dark:text-zinc-400">
-        <li>Demo records are process-local.</li>
-        <li>Run Prepare demo again after the development server restarts.</li>
-        <li>No Pinch requests are made during preparation.</li>
-      </ul>
 
+      {/* A. Development-only and evidence-provenance notice. */}
+      <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
+        <p className="font-medium">Development-only page.</p>
+        <p className="mt-1">
+          Every scenario below carries its evidence provenance: the active
+          journeys are development scenarios, the completed temporary result
+          is a deterministic development fixture, and the completed permanent
+          result is a development representation of a previously verified
+          live Pinch sandbox result. No Pinch requests are made during
+          preparation.
+        </p>
+      </div>
+
+      {/* B. Prepare demo control and current preparation status. */}
       <div className="mt-5 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
         <p className="font-medium">
           Status:{" "}
@@ -109,81 +132,28 @@ export default async function DemoSetupPage() {
             Prepared at {formatSydneyTime(demo.preparedAt)}.
           </p>
         ) : null}
-        {demo.prepared ? (
-          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">
-            Records reset when the development server restarts — run Prepare
-            demo again afterwards.
-          </p>
-        ) : null}
+        <p className="mt-1 text-zinc-600 dark:text-zinc-400">
+          Prepare demo recreates the complete DueLogic presentation state in
+          one click: three tokenised customer journeys with fresh simulated
+          invitation emails, plus the two completed-result fixtures. It
+          removes only the records created by the previous demo run —
+          unrelated records and all live sandbox evidence stay untouched.
+        </p>
         <div className="mt-3">
           <PrepareDemoButton prepared={demo.prepared} />
         </div>
-        {demo.prepared && demo.demoRunId !== null ? (
-          <p className="mt-3 font-mono text-[10px] text-zinc-400 dark:text-zinc-600">
-            demoRunId: {demo.demoRunId}
-          </p>
-        ) : null}
       </div>
 
-      {demo.prepared ? (
-        <>
-          <h2 className="mt-6 text-base font-semibold">Customer journeys</h2>
-          <ul className="mt-3 flex flex-col gap-3">
-            {demo.scenarios
-              .filter((scenario) => scenario.kind === "customer-journey")
-              .map((scenario) => (
-                <li
-                  key={scenario.scenarioKey}
-                  className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800"
-                >
-                  <div className="flex flex-wrap items-baseline gap-2">
-                    <p className="font-semibold">{scenario.displayLabel}</p>
-                    <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-900 dark:bg-sky-950 dark:text-sky-300">
-                      {scenario.provenanceLabel}
-                    </span>
-                  </div>
-                  <p className="mt-2">
-                    <Link
-                      href={scenario.reviewPath}
-                      className="inline-block rounded bg-zinc-900 px-4 py-1.5 font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
-                    >
-                      Open customer journey
-                    </Link>
-                  </p>
-                </li>
-              ))}
-          </ul>
+      {/* C. Recommended demo sequence. */}
+      <h2 className="mt-6 text-base font-semibold">Recommended demo sequence</h2>
+      <ol className="mt-2 list-decimal pl-5 text-zinc-600 dark:text-zinc-400">
+        {DEMO_SEQUENCE.map((step) => (
+          <li key={step}>{step}</li>
+        ))}
+      </ol>
 
-          <h2 className="mt-6 text-base font-semibold">Completed results</h2>
-          <ul className="mt-3 flex flex-col gap-3">
-            {demo.scenarios
-              .filter((scenario) => scenario.kind === "completed-result")
-              .map((scenario) => (
-                <li
-                  key={scenario.scenarioKey}
-                  className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800"
-                >
-                  <div className="flex flex-wrap items-baseline gap-2">
-                    <p className="font-semibold">{scenario.displayLabel}</p>
-                    <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300">
-                      {scenario.provenanceLabel}
-                    </span>
-                  </div>
-                  <p className="mt-2">
-                    <Link
-                      href={scenario.reviewPath}
-                      className="inline-block rounded bg-zinc-900 px-4 py-1.5 font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
-                    >
-                      Open completed result
-                    </Link>
-                  </p>
-                </li>
-              ))}
-          </ul>
-        </>
-      ) : null}
-
-      <h2 className="mt-6 text-base font-semibold">Supporting screens</h2>
+      {/* D. Direct navigation. */}
+      <h2 className="mt-6 text-base font-semibold">Direct navigation</h2>
       <ul className="mt-2 flex flex-col gap-1">
         <li>
           <Link href="/" className="font-medium underline underline-offset-4">
@@ -215,7 +185,77 @@ export default async function DemoSetupPage() {
         </li>
       </ul>
 
-      <p className="mt-8 text-xs text-zinc-500 dark:text-zinc-500">
+      {demo.prepared ? (
+        <>
+          {/* E. Active customer-journey scenarios, presentation order. */}
+          <h2 className="mt-6 text-base font-semibold">Customer journeys</h2>
+          <ul className="mt-3 flex flex-col gap-3">
+            {journeys.map((scenario) => (
+              <li
+                key={scenario.scenarioKey}
+                className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800"
+              >
+                <div className="flex flex-wrap items-baseline gap-2">
+                  <p className="font-semibold">{scenario.displayLabel}</p>
+                  <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-900 dark:bg-sky-950 dark:text-sky-300">
+                    {scenario.provenanceLabel}
+                  </span>
+                </div>
+                <p className="mt-2">
+                  <Link
+                    href={scenario.reviewPath}
+                    className="inline-block rounded bg-zinc-900 px-4 py-1.5 font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
+                  >
+                    Open customer journey
+                  </Link>
+                </p>
+              </li>
+            ))}
+          </ul>
+
+          {/* F + G. Completed results: the deterministic temporary fixture,
+              then the previously verified live Pinch sandbox evidence. */}
+          <h2 className="mt-6 text-base font-semibold">Completed results</h2>
+          <ul className="mt-3 flex flex-col gap-3">
+            {completed.map((scenario) => (
+              <li
+                key={scenario.scenarioKey}
+                className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800"
+              >
+                <div className="flex flex-wrap items-baseline gap-2">
+                  <p className="font-semibold">{scenario.displayLabel}</p>
+                  <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300">
+                    {scenario.provenanceLabel}
+                  </span>
+                </div>
+                <p className="mt-2">
+                  <Link
+                    href={scenario.reviewPath}
+                    className="inline-block rounded bg-zinc-900 px-4 py-1.5 font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
+                  >
+                    Open completed result
+                  </Link>
+                </p>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+
+      {/* H. Process-local state and restart reminder. */}
+      <ul className="mt-6 list-disc pl-5 text-zinc-600 dark:text-zinc-400">
+        <li>Demo records are process-local.</li>
+        <li>Run Prepare demo again after the development server restarts.</li>
+        <li>No Pinch requests are made during preparation.</li>
+      </ul>
+
+      {/* I. Supporting technical details at the bottom. */}
+      {demo.prepared && demo.demoRunId !== null ? (
+        <p className="mt-6 font-mono text-[10px] text-zinc-400 dark:text-zinc-600">
+          demoRunId: {demo.demoRunId}
+        </p>
+      ) : null}
+      <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-500">
         Development page: {validation.scenarioCount} demo-preparation
         scenarios re-asserted on this render. Records are kept in memory and
         are lost when the development server restarts.

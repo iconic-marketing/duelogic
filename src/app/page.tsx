@@ -44,8 +44,11 @@ import { ReplacementPanel } from "./replacement-panel";
 
 /**
  * The DueLogic merchant dashboard: one page over the deterministic
- * capabilities. Sections 1-6 (summary, opportunity, history, detected
- * patterns, policy decisions) are server-rendered from the synthetic seed,
+ * capabilities, ordered along the merchant workflow — policy, historical
+ * policy impact, payment-book analysis, detected timing patterns and their
+ * history, customer invitation activity, then operational audit evidence.
+ * The deterministic sections (summary, policy replay, opportunity, detected
+ * patterns, history) are server-rendered from the synthetic seed,
  * the detector and the policy engine — no Pinch call, no model output.
  * The pattern flags and policy evaluations come from the shared
  * seed-policy-evaluations builder evaluated under the active saved
@@ -171,29 +174,42 @@ export default async function DashboardPage() {
       </header>
 
       <MerchantSummary merchant={seedMerchant} summary={seedSummary} />
-      <MerchantOpportunityPanel
-        result={opportunity}
-        governingPolicyVersion={governingPolicy.version}
+
+      {/* A. Merchant policy: status, ceiling, safeguards, activation. */}
+      <PolicyConfigPanel
+        initialActive={policyView.active}
+        initialHistory={policyView.history}
       />
-      <PaymentHistory items={flaggedItems} records={seedPaymentRecords} />
-      <PatternPanel
-        items={flaggedItems}
-        asOfDate={seedSummary.lastScheduledDate}
-      />
+
+      {/* B. Historical policy impact: replay decisions and assumptions. */}
       <PolicyPanel
         items={policyItems}
         policy={governingPolicy}
         activeSnapshot={policyView.active}
       />
-      <PolicyConfigPanel
-        initialActive={policyView.active}
-        initialHistory={policyView.history}
+
+      {/* C. Payment-book analysis: opportunity and eligible-value figures. */}
+      <MerchantOpportunityPanel
+        result={opportunity}
+        governingPolicyVersion={governingPolicy.version}
       />
-      <ReplacementPanel policyDecision={replacementPolicyDecision} />
+
+      {/* D. Detected timing patterns: evidence, then the payment and
+          settlement history behind it. */}
+      <PatternPanel
+        items={flaggedItems}
+        asOfDate={seedSummary.lastScheduledDate}
+      />
+      <PaymentHistory items={flaggedItems} records={seedPaymentRecords} />
+
+      {/* E + F. Customer invitation activity and completed interventions. */}
       <InterventionPanel
         summary={interventionSummary}
         interventions={interventionProjections}
       />
+
+      {/* G. Operational history and audit evidence. */}
+      <ReplacementPanel policyDecision={replacementPolicyDecision} />
 
       <details className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
         <summary className="cursor-pointer font-medium">
