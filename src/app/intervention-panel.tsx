@@ -48,6 +48,15 @@ const STATUS_LABELS: Array<{
   { key: "manualRecoveryRequired", label: "Manual recovery" },
 ];
 
+/**
+ * Development fixture records (demo and movement-fixture seeding) all use
+ * the int_fixture_ prefix; the dashboard labels them so fixture rows can
+ * never read as live sandbox evidence.
+ */
+function isFixtureIntervention(interventionId: string): boolean {
+  return interventionId.startsWith("int_fixture_");
+}
+
 export function InterventionPanel({
   summary,
   interventions,
@@ -55,6 +64,9 @@ export function InterventionPanel({
   const router = useRouter();
   const [running, setRunning] = useState(false);
   const [feedback, setFeedback] = useState<ScanFeedback | null>(null);
+  const hasFixtures = interventions.some((intervention) =>
+    isFixtureIntervention(intervention.interventionId),
+  );
 
   const runScan = async () => {
     if (running) {
@@ -137,6 +149,13 @@ export function InterventionPanel({
         ))}
       </dl>
 
+      {hasFixtures ? (
+        <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-500">
+          Counts include development fixture records; fixture rows are
+          labelled in the table below and are never live sandbox evidence.
+        </p>
+      ) : null}
+
       {interventions.length > 0 ? (
         <div className="mt-4 overflow-x-auto">
           <table className="w-full min-w-[36rem] border-collapse text-left">
@@ -158,6 +177,11 @@ export function InterventionPanel({
                 >
                   <td className="py-1.5 pr-4 font-mono text-xs">
                     {intervention.interventionId}
+                    {isFixtureIntervention(intervention.interventionId) ? (
+                      <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 font-sans text-[10px] font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300">
+                        Development fixture
+                      </span>
+                    ) : null}
                   </td>
                   <td className="py-1.5 pr-4 font-medium">
                     {intervention.status}

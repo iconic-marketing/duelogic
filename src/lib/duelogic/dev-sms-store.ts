@@ -122,3 +122,27 @@ export function clearDevSmsStore(): void {
   const holder = globalThis as GlobalWithSmsStore;
   holder.__duelogicDevSmsStore?.clear();
 }
+
+/**
+ * Development-store-only targeted deletion for demo preparation: removes
+ * the messages belonging to exactly the named interventions (the safe
+ * tracked linkage — the manifest records the demo intervention IDs) and
+ * nothing else. Unrelated messages remain untouched. Defaults to the
+ * shared development map; validation passes its own isolated map.
+ */
+export function deleteSmsMessagesForInterventions(
+  interventionIds: readonly string[],
+  messages?: SmsMap,
+): number {
+  const holder = globalThis as GlobalWithSmsStore;
+  const target = messages ?? (holder.__duelogicDevSmsStore ??= new Map());
+  const wanted = new Set(interventionIds);
+  let deleted = 0;
+  for (const [key, message] of [...target.entries()]) {
+    if (wanted.has(message.interventionId)) {
+      target.delete(key);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}

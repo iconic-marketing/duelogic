@@ -17,6 +17,7 @@
  * cadence and cycle boundaries are never inferred from payment spacing.
  */
 
+import { addCalendarDays, calendarDaysBetween } from "./calendar-date";
 import type { MerchantPlanScheduleConfiguration } from "./schema";
 
 export interface InterventionDemoFixture {
@@ -87,3 +88,35 @@ export const INTERVENTION_DEMO_FIXTURE: InterventionDemoFixture = {
   currentArrearsCents: 0,
   currency: "AUD",
 };
+
+/**
+ * The anchored fixed-day billing cycle of the demonstration plan that
+ * contains `date`: pure arithmetic over the trusted merchant-held mapping
+ * above — cadence and cycle boundaries are never inferred from payments.
+ * Returns null when the demo plan mapping is not the anchored fixed-day
+ * shape or the date cannot be resolved. Shared by the development fixture
+ * seeding paths so the cycle derivation exists once.
+ */
+export function anchoredDemoPlanCycleContaining(
+  date: string,
+): { start: string; end: string } | null {
+  const mapping =
+    INTERVENTION_DEMO_FIXTURE.planScheduleConfiguration.plans[
+      INTERVENTION_DEMO_FIXTURE.planId
+    ];
+  if (mapping === undefined || mapping.cycleDefinition !== "fixed-days") {
+    return null;
+  }
+  const offset = calendarDaysBetween(mapping.cycleAnchorDate, date);
+  if (offset === null) {
+    return null;
+  }
+  const cycleIndex = Math.floor(offset / mapping.cycleLengthDays);
+  const start = addCalendarDays(
+    mapping.cycleAnchorDate,
+    cycleIndex * mapping.cycleLengthDays,
+  );
+  const end =
+    start === null ? null : addCalendarDays(start, mapping.cycleLengthDays - 1);
+  return start === null || end === null ? null : { start, end };
+}

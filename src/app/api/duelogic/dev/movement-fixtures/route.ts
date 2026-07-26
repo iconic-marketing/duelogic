@@ -1,13 +1,16 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { isDirectLocalhostRequest } from "@/lib/dev/localhost-guard";
-import { addCalendarDays, calendarDaysBetween } from "@/lib/duelogic/calendar-date";
+import { addCalendarDays } from "@/lib/duelogic/calendar-date";
 import {
   getDevInterventionNotificationRepository,
   getDevInterventionRepository,
 } from "@/lib/duelogic/dev-intervention-store";
 import { getDevFixturePaymentRepository } from "@/lib/duelogic/dev-movement-store";
 import type { DueLogicInterventionRecord } from "@/lib/duelogic/intervention";
-import { INTERVENTION_DEMO_FIXTURE } from "@/lib/duelogic/intervention-fixture";
+import {
+  anchoredDemoPlanCycleContaining,
+  INTERVENTION_DEMO_FIXTURE,
+} from "@/lib/duelogic/intervention-fixture";
 import {
   generateInterventionToken,
   hashInterventionToken,
@@ -51,30 +54,6 @@ function merchantToday(): string {
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
-}
-
-/** The anchored fixed-day cycle containing `date` for the demo plan. */
-function anchoredCycleFor(date: string): { start: string; end: string } | null {
-  const mapping =
-    INTERVENTION_DEMO_FIXTURE.planScheduleConfiguration.plans[
-      INTERVENTION_DEMO_FIXTURE.planId
-    ];
-  if (mapping === undefined || mapping.cycleDefinition !== "fixed-days") {
-    return null;
-  }
-  const offset = calendarDaysBetween(mapping.cycleAnchorDate, date);
-  if (offset === null) {
-    return null;
-  }
-  const cycleIndex = Math.floor(offset / mapping.cycleLengthDays);
-  const start = addCalendarDays(
-    mapping.cycleAnchorDate,
-    cycleIndex * mapping.cycleLengthDays,
-  );
-  const end = start === null
-    ? null
-    : addCalendarDays(start, mapping.cycleLengthDays - 1);
-  return start === null || end === null ? null : { start, end };
 }
 
 export async function POST(request: NextRequest) {
@@ -123,7 +102,7 @@ export async function POST(request: NextRequest) {
     }
 
     const mapped = scenario === "all-options";
-    const cycle = mapped ? anchoredCycleFor(startDate) : null;
+    const cycle = mapped ? anchoredDemoPlanCycleContaining(startDate) : null;
     if (mapped && cycle === null) {
       return NextResponse.json(
         { ok: false, stage: "configuration" },

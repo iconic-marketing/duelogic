@@ -244,3 +244,25 @@ export function clearDevOtpChallengeStore(): void {
   const holder = globalThis as GlobalWithOtpStore;
   holder.__duelogicDevOtpChallengeStore?.clear();
 }
+
+/**
+ * Development-store-only targeted deletion for demo preparation: removes
+ * the challenges belonging to exactly the named interventions and nothing
+ * else. Returns the number removed; missing IDs are ignored. Defaults to
+ * the shared development map; validation passes its own isolated map.
+ */
+export function deleteOtpChallengesForInterventions(
+  interventionIds: readonly string[],
+  challenges?: ChallengeMap,
+): number {
+  const holder = globalThis as GlobalWithOtpStore;
+  const target =
+    challenges ?? (holder.__duelogicDevOtpChallengeStore ??= new Map());
+  let deleted = 0;
+  for (const id of interventionIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}

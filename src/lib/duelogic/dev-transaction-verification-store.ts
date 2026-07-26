@@ -197,6 +197,30 @@ export function clearDevTransactionVerificationStore(): void {
   holder.__duelogicDevTransactionVerificationStore?.clear();
 }
 
+/**
+ * Development-store-only targeted deletion for demo preparation: removes
+ * the verification records belonging to exactly the named interventions
+ * and nothing else. Returns the number removed; missing IDs are ignored.
+ * Defaults to the shared development map; validation passes its own
+ * isolated map. Never part of the claim contract.
+ */
+export function deleteTransactionVerificationsForInterventions(
+  interventionIds: readonly string[],
+  verifications?: VerificationMap,
+): number {
+  const holder = globalThis as GlobalWithVerificationStore;
+  const target =
+    verifications ??
+    (holder.__duelogicDevTransactionVerificationStore ??= new Map());
+  let deleted = 0;
+  for (const id of interventionIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
 /** Server-generated verification identifier. Never accepted from a browser. */
 export function generateTransactionVerificationId(): string {
   return `ver_${randomUUID()}`;

@@ -422,6 +422,92 @@ export function getDevTemporaryOperationRepository(): TemporaryOperationReposito
   );
 }
 
+/**
+ * Development-store-only targeted deletions for demo preparation: each
+ * removes only records belonging to the named demo interventions (or the
+ * explicitly named operation IDs) and nothing else. Never part of the
+ * production repository contracts. Defaults to the shared development
+ * maps; validation passes its own isolated maps.
+ */
+export function deleteTemporarySelectionsForInterventions(
+  interventionIds: readonly string[],
+  selections?: SelectionMap,
+): number {
+  const holder = globalThis as GlobalWithTemporaryStores;
+  const target =
+    selections ?? (holder.__duelogicDevTemporarySelectionStore ??= new Map());
+  let deleted = 0;
+  for (const id of interventionIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+export function deleteTemporaryVerificationsForInterventions(
+  interventionIds: readonly string[],
+  verifications?: VerificationMap,
+): number {
+  const holder = globalThis as GlobalWithTemporaryStores;
+  const target =
+    verifications ??
+    (holder.__duelogicDevTemporaryVerificationStore ??= new Map());
+  let deleted = 0;
+  for (const id of interventionIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+export function deleteTemporaryConfirmationsForInterventions(
+  interventionIds: readonly string[],
+  confirmations?: ConfirmationMap,
+): number {
+  const holder = globalThis as GlobalWithTemporaryStores;
+  const target =
+    confirmations ??
+    (holder.__duelogicDevTemporaryConfirmationStore ??= new Map());
+  const wanted = new Set(interventionIds);
+  let deleted = 0;
+  for (const [key, record] of [...target.entries()]) {
+    if (wanted.has(record.interventionId)) {
+      target.delete(key);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+/**
+ * Removes operation evidence named by ID (demo-seeded history) or
+ * belonging to a named demo intervention (journey-created evidence).
+ */
+export function deleteTemporaryOperationsByIdOrIntervention(
+  operationIds: readonly string[],
+  interventionIds: readonly string[],
+  operations?: OperationMap,
+): number {
+  const holder = globalThis as GlobalWithTemporaryStores;
+  const target =
+    operations ?? (holder.__duelogicDevTemporaryOperationStore ??= new Map());
+  const wantedOperations = new Set(operationIds);
+  const wantedInterventions = new Set(interventionIds);
+  let deleted = 0;
+  for (const [key, record] of [...target.entries()]) {
+    if (
+      wantedOperations.has(record.operationId) ||
+      wantedInterventions.has(record.interventionId)
+    ) {
+      target.delete(key);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
 export function generateTemporarySelectionId(): string {
   return `tsel_${randomUUID()}`;
 }

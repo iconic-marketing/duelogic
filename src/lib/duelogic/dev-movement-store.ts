@@ -198,3 +198,42 @@ export function getDevFixturePaymentRepository(): FixturePaymentRepository {
     holder.__duelogicDevFixturePaymentStore,
   );
 }
+
+/**
+ * Development-store-only targeted deletion for demo preparation: removes
+ * the movement choices belonging to exactly the named interventions.
+ * Returns the number removed; missing IDs are ignored. Defaults to the
+ * shared development map; validation passes its own isolated map.
+ */
+export function deleteMovementChoicesForInterventions(
+  interventionIds: readonly string[],
+  choices?: ChoiceMap,
+): number {
+  const holder = globalThis as GlobalWithMovementStores;
+  const target =
+    choices ?? (holder.__duelogicDevMovementChoiceStore ??= new Map());
+  let deleted = 0;
+  for (const id of interventionIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+/** Targeted deletion of exactly the named fixture payments (by payment ID). */
+export function deleteFixturePaymentsById(
+  paymentIds: readonly string[],
+  payments?: FixturePaymentMap,
+): number {
+  const holder = globalThis as GlobalWithMovementStores;
+  const target =
+    payments ?? (holder.__duelogicDevFixturePaymentStore ??= new Map());
+  let deleted = 0;
+  for (const id of paymentIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}

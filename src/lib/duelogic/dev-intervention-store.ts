@@ -178,3 +178,44 @@ export function clearDevInterventionStore(): void {
   holder.__duelogicDevInterventionStore?.clear();
   holder.__duelogicDevInterventionNotificationStore?.clear();
 }
+
+/**
+ * Development-store-only targeted deletion for demo preparation: removes
+ * exactly the named intervention records and nothing else. Never part of
+ * the production repository contract. Returns the number removed; missing
+ * IDs are ignored. Defaults to the shared development map; validation
+ * passes its own isolated map.
+ */
+export function deleteInterventionRecordsById(
+  interventionIds: readonly string[],
+  interventions?: InterventionMap,
+): number {
+  const holder = globalThis as GlobalWithInterventionStore;
+  const target =
+    interventions ?? (holder.__duelogicDevInterventionStore ??= new Map());
+  let deleted = 0;
+  for (const id of interventionIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+/** Targeted deletion of exactly the named notification records. */
+export function deleteInterventionNotificationsById(
+  notificationIds: readonly string[],
+  notifications?: NotificationMap,
+): number {
+  const holder = globalThis as GlobalWithInterventionStore;
+  const target =
+    notifications ??
+    (holder.__duelogicDevInterventionNotificationStore ??= new Map());
+  let deleted = 0;
+  for (const id of notificationIds) {
+    if (target.delete(id)) {
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
