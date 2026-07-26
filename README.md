@@ -58,12 +58,47 @@ The customer can be offered up to three movement choices:
 - **Change this and future payments**
 - **Keep this payment and change future payments**
 
+### Policy rules demonstrated
+
+- A temporary payment-date move is limited to two completed and
+  read-back-verified temporary moves per payer in a rolling 12-month
+  period.
+- A permanent schedule correction is limited to one completed and
+  read-back-verified permanent change per payer in a rolling 12-month
+  period.
+- A temporary move changes one scheduled Payment only: it may move the
+  payment later by no more than five calendar days, it retains the same
+  Pinch Payment ID, and later recurring payments remain unchanged.
+- A permanent correction can change the current and future payments, or
+  retain the current payment and change future payments from the next
+  cycle. The replacement schedule comes from Pinch calculated-payments
+  using the trusted Plan cadence — never calculated locally.
+- Only completed changes confirmed by authoritative read-back consume an
+  allowance. Failed previews, abandoned journeys and unsuccessful
+  operations do not consume completed usage.
+- When a limit is reached, the affected option is removed server-side.
+
+In the hackathon prototype, the payment amount ceiling is
+merchant-configurable, while usage limits and the other safeguards are
+fixed, versioned policy values — they are not editable in the current
+interface. The intended production model is for approved limits to be
+configurable through the merchant policy, subject to system-enforced
+safeguards. Either way, each invitation remains bound to the policy
+version that approved it.
+
 Availability is derived server-side by probing the policy engine and
 cadence resolver with the merchant policy bound to the invitation, the
 customer's verified prior-change history, the trusted plan cadence,
 rolling usage limits, explicitly supplied arrears and the current live
 state. The browser never decides what is available, and a customer
 request can never select an execution path.
+
+Routine eligible requests do not require individual merchant approval.
+The merchant configures and activates the policy, reviews opportunity
+and activity information, and handles escalations or manual-recovery
+cases. Routine verified outcomes are recorded automatically; ambiguous
+or manual-recovery states are surfaced to the merchant and are never
+automatically retried.
 
 ## Meaningful use of the Pinch API
 
@@ -279,6 +314,12 @@ Pinch.
   masked. Email and SMS are separate channels by construction: the
   review link never enters the SMS store, and OTP codes never appear in
   email.
+- **Close-payment warning** — a warning and acknowledgement are
+  required when the chosen date falls close to the following scheduled
+  payment under the trusted cadence. The acknowledgement is bound to
+  the movement, selected date and exact preview, and changing the
+  selection invalidates it. It is an acknowledgement requirement, never
+  an automatic rejection and never a manual escalation.
 - **Time-limited verification** — OTP codes expire after five minutes
   and verification records after ten; expiry is evaluated server-side.
 - **Separate final confirmation** — verification never confirms or
