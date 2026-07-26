@@ -24,6 +24,7 @@
  * verification.
  */
 
+import { calendarDaysBetween, parseCalendarDate } from "./calendar-date";
 import {
   effectiveInterventionStatus,
   type DueLogicInterventionRecord,
@@ -311,6 +312,11 @@ export async function evaluateAndBindTemporarySelection(
     currentArrearsCents: deps.currentArrearsCents(),
     currentPaymentDate: payment.transactionDate,
     requestedDate: input.requestedDate.trim(),
+    // Trusted assigned-cycle bounds stored on the intervention at
+    // creation: the engine refuses any revised date beyond the cycle end
+    // and returns the latest compliant date as the alternative.
+    currentCycleStartDate: record.currentCycleStartDate,
+    currentCycleEndDate: record.currentCycleEndDate,
   };
 
   let decision;
@@ -676,6 +682,7 @@ export type ExecuteTemporaryChangeOutcome =
         | "payment-unreadable"
         | "payment-not-scheduled"
         | "payment-mismatch"
+        | "selection-outside-assigned-cycle"
         | "verification-required"
         | "confirmation-failed"
         | "operation-evidence-failed"
@@ -730,7 +737,8 @@ export async function executeTemporaryPaymentChange(
   }
 
   // 6. The bound immutable policy snapshot must still resolve.
-  if ((await resolveBoundSnapshot(deps.policies, record)) === null) {
+  const snapshot = await resolveBoundSnapshot(deps.policies, record);
+  if (snapshot === null) {
     return { ok: false, reason: "policy-unresolved", record };
   }
 
@@ -755,6 +763,39 @@ export async function executeTemporaryPaymentChange(
     payment.amountInCents !== selection.amountInCents
   ) {
     return { ok: false, reason: "payment-mismatch", record };
+  }
+
+  // 9b. Assigned-billing-cycle re-check, deterministically re-asserted
+  // immediately before the claim against the intervention's stored trusted
+  // cycle bounds and the bound policy's shift cap: a forged, stale or
+  // next-cycle bound date refuses here — before any claim, confirmation,
+  // evidence or mutation — and consumes nothing. Every value is strictly
+  // validated as a calendar date FIRST: lexical comparison alone could be
+  // fooled by a corrupted non-date string that sorts after valid ISO
+  // dates, so malformed stored metadata refuses outright.
+  const cycleDatesValid =
+    parseCalendarDate(record.currentCycleStartDate) !== null &&
+    parseCalendarDate(record.currentCycleEndDate) !== null &&
+    parseCalendarDate(selection.originalTransactionDate) !== null &&
+    parseCalendarDate(selection.proposedTransactionDate) !== null;
+  const boundShiftDays = cycleDatesValid
+    ? calendarDaysBetween(
+        selection.originalTransactionDate,
+        selection.proposedTransactionDate,
+      )
+    : null;
+  if (
+    !cycleDatesValid ||
+    boundShiftDays === null ||
+    boundShiftDays < 1 ||
+    boundShiftDays > snapshot.policy.temporaryChange.maxShiftDays ||
+    record.currentCycleStartDate > record.currentCycleEndDate ||
+    selection.originalTransactionDate < record.currentCycleStartDate ||
+    selection.originalTransactionDate > record.currentCycleEndDate ||
+    selection.proposedTransactionDate < record.currentCycleStartDate ||
+    selection.proposedTransactionDate > record.currentCycleEndDate
+  ) {
+    return { ok: false, reason: "selection-outside-assigned-cycle", record };
   }
 
   // 10. ATOMIC single-use claim of the exact temporary verification.

@@ -68,7 +68,7 @@ export const MOVEMENT_OPTION_COPY: Record<
 > = {
   temporary: {
     label: "Move this payment only",
-    copy: "Choose a new date for this upcoming payment. Your regular payment schedule will stay the same.",
+    copy: "Your payment can be moved later within its current billing cycle, up to five calendar days from its current date. Your regular payment schedule will stay the same.",
   },
   "permanent-current-cycle": {
     label: "Change this and future payments",
@@ -284,11 +284,20 @@ export async function deriveMovementAvailability(
     payment.status.toLowerCase() === "scheduled"
   ) {
     const probeDate = addCalendarDays(payment.transactionDate, 1);
-    const windowEnd = addCalendarDays(
+    const shiftWindowEnd = addCalendarDays(
       payment.transactionDate,
       snapshot.policy.temporaryChange.maxShiftDays,
     );
-    if (probeDate !== null && windowEnd !== null) {
+    // Assigned-billing-cycle clamp: the revised date must remain inside
+    // the cycle bound to the intervention from trusted metadata, so the
+    // permitted window ends at the earlier of the shift cap and the cycle
+    // end. Near the boundary only the shorter compliant date set is
+    // offered; with no later compliant date, the option is not offered.
+    const windowEnd =
+      shiftWindowEnd !== null && shiftWindowEnd > record.currentCycleEndDate
+        ? record.currentCycleEndDate
+        : shiftWindowEnd;
+    if (probeDate !== null && windowEnd !== null && probeDate <= windowEnd) {
       const probe: TemporaryPolicyEvaluationRequest = {
         changeType: "temporary",
         payerId: record.payerId,
@@ -298,6 +307,8 @@ export async function deriveMovementAvailability(
         currentArrearsCents: deps.currentArrearsCents(),
         currentPaymentDate: payment.transactionDate,
         requestedDate: probeDate,
+        currentCycleStartDate: record.currentCycleStartDate,
+        currentCycleEndDate: record.currentCycleEndDate,
       };
       try {
         const decision = evaluateScheduleChange(

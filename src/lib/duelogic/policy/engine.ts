@@ -57,6 +57,19 @@ export type TemporaryPolicyEvaluationRequest = PolicyEvaluationCommon & {
   changeType: "temporary";
   currentPaymentDate: string;
   requestedDate: string;
+  /**
+   * Optional trusted assigned-billing-cycle bounds for the affected
+   * payment, supplied together from stored merchant metadata (for monthly
+   * schedules, the complete merchant-local calendar month) — never
+   * inferred and never client-supplied. When present, the revised date
+   * must remain inside this cycle: a request beyond the cycle end returns
+   * the latest compliant date as the shorter alternative, and when no
+   * later compliant date exists the request escalates. The customer
+   * movement journey always supplies these; the historical replay
+   * illustration does not, and behaviour without them is unchanged.
+   */
+  currentCycleStartDate?: string;
+  currentCycleEndDate?: string;
 };
 
 export type PermanentPolicyEvaluationRequest = PolicyEvaluationCommon & {
@@ -151,8 +164,13 @@ export type ApprovedPolicyDecision =
 export type TemporaryShorterAlternativeDecision = PolicyDecisionCommon & {
   outcome: "shorter-alternative";
   changeType: "temporary";
-  reasonCode: "TEMPORARY_SHIFT_EXCEEDS_MAXIMUM";
-  ruleFired: "temporaryChange.maxShiftDays";
+  /** The binding constraint: the shift cap, or the assigned-cycle end. */
+  reasonCode:
+    | "TEMPORARY_SHIFT_EXCEEDS_MAXIMUM"
+    | "TEMPORARY_OUTSIDE_ASSIGNED_CYCLE";
+  ruleFired:
+    | "temporaryChange.maxShiftDays"
+    | "temporaryChange.assignedBillingCycle";
   requestedShiftDays: number;
   maximumShiftDays: number;
   alternativeDate: string;
@@ -183,6 +201,7 @@ export type EscalationReasonCode =
   | "CURRENT_ARREARS_PRESENT"
   | "AMOUNT_CEILING_EXCEEDED"
   | "TEMPORARY_CHANGE_LIMIT_REACHED"
+  | "TEMPORARY_NO_DATE_IN_ASSIGNED_CYCLE"
   | "PERMANENT_CHANGE_LIMIT_REACHED"
   | "PERMANENT_SCHEDULE_CADENCE_UNSUPPORTED";
 
@@ -486,6 +505,36 @@ function assertTemporaryRequest(request: TemporaryPolicyEvaluationRequest): void
       "TEMPORARY_DATE_NOT_LATER",
       "requestedDate must be strictly later than currentPaymentDate.",
     );
+  }
+  // Optional trusted assigned-cycle bounds: supplied together, well formed,
+  // and containing the affected payment — malformed or contradictory cycle
+  // metadata is a validation error, never repaired or inferred.
+  const { currentCycleStartDate, currentCycleEndDate } = request;
+  if ((currentCycleStartDate === undefined) !== (currentCycleEndDate === undefined)) {
+    invalidCycle(
+      "Temporary assigned-cycle bounds must be supplied together or not at all.",
+    );
+  }
+  if (currentCycleStartDate !== undefined && currentCycleEndDate !== undefined) {
+    if (
+      parseCalendarDate(currentCycleStartDate) === null ||
+      parseCalendarDate(currentCycleEndDate) === null
+    ) {
+      invalidCycle(
+        "Temporary assigned-cycle bounds must be valid YYYY-MM-DD calendar dates.",
+      );
+    }
+    if (currentCycleStartDate > currentCycleEndDate) {
+      invalidCycle("currentCycleStartDate must be on or before currentCycleEndDate.");
+    }
+    if (
+      request.currentPaymentDate < currentCycleStartDate ||
+      request.currentPaymentDate > currentCycleEndDate
+    ) {
+      invalidCycle(
+        "currentPaymentDate must fall inside the supplied assigned cycle.",
+      );
+    }
   }
 }
 
@@ -883,24 +932,52 @@ function evaluateTemporarySchedule(
 ): PolicyDecision {
   const maxShiftDays = policy.temporaryChange.maxShiftDays;
   const shiftDays = daysBetween(request.currentPaymentDate, request.requestedDate);
+  const shiftLimitDate = addDays(request.currentPaymentDate, maxShiftDays);
 
-  if (shiftDays > maxShiftDays) {
-    const alternativeDate = addDays(request.currentPaymentDate, maxShiftDays);
+  // Assigned-billing-cycle bound: when trusted cycle bounds are supplied,
+  // the latest permitted date is the earlier of the shift-cap date and the
+  // cycle end — a temporary move may never defer the payment into a later
+  // assigned cycle (for monthly schedules, a later calendar month).
+  const cycleEnd = request.currentCycleEndDate;
+  const cycleBindsFirst = cycleEnd !== undefined && cycleEnd < shiftLimitDate;
+  const latestPermittedDate = cycleBindsFirst ? cycleEnd : shiftLimitDate;
+
+  if (latestPermittedDate <= request.currentPaymentDate) {
+    // The payment already sits on its cycle end: no later compliant date
+    // exists, so the temporary option is unavailable for this payment.
+    return buildEscalation(
+      request,
+      policy,
+      usage,
+      "TEMPORARY_NO_DATE_IN_ASSIGNED_CYCLE",
+      "temporaryChange.assignedBillingCycle",
+      "No later date is available inside this payment's assigned billing cycle, so the request requires manual review.",
+    );
+  }
+
+  if (request.requestedDate > latestPermittedDate) {
     return {
       outcome: "shorter-alternative",
       changeType: "temporary",
-      reasonCode: "TEMPORARY_SHIFT_EXCEEDS_MAXIMUM",
-      ruleFired: "temporaryChange.maxShiftDays",
-      explanation:
-        `The requested payment date is ${shiftDays} ${dayWord(shiftDays)} later than ` +
-        `the current date. The merchant's automatic limit is ${maxShiftDays} ` +
-        `${dayWord(maxShiftDays)}, so ${formatDayMonth(alternativeDate)} is the latest ` +
-        "date available automatically.",
+      reasonCode: cycleBindsFirst
+        ? "TEMPORARY_OUTSIDE_ASSIGNED_CYCLE"
+        : "TEMPORARY_SHIFT_EXCEEDS_MAXIMUM",
+      ruleFired: cycleBindsFirst
+        ? "temporaryChange.assignedBillingCycle"
+        : "temporaryChange.maxShiftDays",
+      explanation: cycleBindsFirst
+        ? `The requested payment date falls outside this payment's assigned ` +
+          `billing cycle, so ${formatDayMonth(latestPermittedDate)} is the latest ` +
+          "date available automatically."
+        : `The requested payment date is ${shiftDays} ${dayWord(shiftDays)} later than ` +
+          `the current date. The merchant's automatic limit is ${maxShiftDays} ` +
+          `${dayWord(maxShiftDays)}, so ${formatDayMonth(latestPermittedDate)} is the latest ` +
+          "date available automatically.",
       evaluatedAt: request.evaluationDate,
       policyVersion: policy.version,
       requestedShiftDays: shiftDays,
       maximumShiftDays: maxShiftDays,
-      alternativeDate,
+      alternativeDate: latestPermittedDate,
       usage,
       confirmationRequired: true,
       warnings: [],

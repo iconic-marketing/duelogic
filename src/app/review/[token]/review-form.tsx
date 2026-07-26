@@ -679,6 +679,11 @@ export function ReviewForm({
           >
             {submitting ? "Checking…" : "Check this date"}
           </button>
+          {temporaryJourney && view.scheduleCadence === "monthly" ? (
+            <p className="w-full text-xs text-zinc-500 dark:text-zinc-500">
+              The revised date must remain within the same calendar month.
+            </p>
+          ) : null}
         </div>
       ) : null}
 

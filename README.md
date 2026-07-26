@@ -73,6 +73,14 @@ The customer can be offered up to three movement choices:
   retain the current payment and change future payments from the next
   cycle. The replacement schedule comes from Pinch calculated-payments
   using the trusted Plan cadence — never calculated locally.
+- Every revised date must remain within the billing cycle assigned to
+  the affected payment — for monthly schedules, the same calendar month
+  and year. Temporary moves are also limited to five calendar days, so
+  near the end of a cycle fewer dates may be available, and where no
+  compliant later date remains the temporary option is unavailable.
+  This prevents an instalment from being deferred into a later assigned
+  billing cycle; it does not by itself prove compliance with every
+  possible merchant contract.
 - Only completed changes confirmed by authoritative read-back consume an
   allowance. Failed previews, abandoned journeys and unsuccessful
   operations do not consume completed usage.
@@ -83,8 +91,8 @@ merchant-configurable, while usage limits and the other safeguards are
 fixed, versioned policy values — they are not editable in the current
 interface. The intended production model is for approved limits to be
 configurable through the merchant policy, subject to system-enforced
-safeguards. Either way, each invitation remains bound to the policy
-version that approved it.
+cycle and contractual safeguards. Either way, each invitation remains
+bound to the policy version that approved it.
 
 Availability is derived server-side by probing the policy engine and
 cadence resolver with the merchant policy bound to the invitation, the
