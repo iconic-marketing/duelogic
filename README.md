@@ -429,6 +429,10 @@ results were verified live in the sandbox and which are deterministic
 development fixtures; the README deliberately claims nothing beyond
 what the repository and its recorded sandbox evidence support.
 
+## Technical documentation
+
+The detailed product scope, decision rules, execution boundaries and validation requirements are documented in [DueLogic Build Scope v8](docs/DueLogic_Build_Scope_v8.md).
+
 ## Repository status
 
 - The default branch is `main`, and it holds the complete prototype:
